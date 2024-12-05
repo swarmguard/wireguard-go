@@ -74,6 +74,10 @@ func UAPIListen(name string, file *os.File) (net.Listener, error) {
 	socketPath := sockPath(name)
 
 	// watch for deletion of socket
+    socketDirectory := os.Getenv("WG_SOCKET_DIR")
+	if socketDirectory == "" {
+		socketDirectory = "/var/run/wireguard"
+	}
 
 	uapi.kqueueFd, err = unix.Kqueue()
 	if err != nil {

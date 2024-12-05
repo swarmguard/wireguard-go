@@ -26,13 +26,21 @@ const (
 
 // socketDirectory is variable because it is modified by a linker
 // flag in wireguard-android.
-var socketDirectory = "/var/run/wireguard"
-
 func sockPath(iface string) string {
+
+    socketDirectory := os.Getenv("WG_SOCKET_DIR")
+	if socketDirectory == "" {
+		socketDirectory = "/var/run/wireguard"
+	}
 	return fmt.Sprintf("%s/%s.sock", socketDirectory, iface)
 }
 
 func UAPIOpen(name string) (*os.File, error) {
+    socketDirectory := os.Getenv("WG_SOCKET_DIR")
+	if socketDirectory == "" {
+		socketDirectory = "/var/run/wireguard"
+	}
+
 	if err := os.MkdirAll(socketDirectory, 0o755); err != nil {
 		return nil, err
 	}
