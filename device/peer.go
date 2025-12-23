@@ -38,9 +38,11 @@ type Peer struct {
 		newHandshake            *Timer
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
+		linkWatchdog            *Timer
 		handshakeAttempts       atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
 		sentLastMinuteHandshake atomic.Bool
+		linkUp                  atomic.Bool
 	}
 
 	state struct {

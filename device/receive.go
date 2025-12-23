@@ -516,6 +516,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			peer.keepKeyFreshReceiving()
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
+			peer.kickLinkWatchdog()
 		}
 		if dataPacketReceived {
 			peer.timersDataReceived()

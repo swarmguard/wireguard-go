@@ -204,12 +204,14 @@ func (peer *Peer) timersInit() {
 	peer.timers.newHandshake = peer.NewTimer(expiredNewHandshake)
 	peer.timers.zeroKeyMaterial = peer.NewTimer(expiredZeroKeyMaterial)
 	peer.timers.persistentKeepalive = peer.NewTimer(expiredPersistentKeepalive)
+	peer.timers.linkWatchdog = peer.NewTimer(expiredLinkWatchdog)
 }
 
 func (peer *Peer) timersStart() {
 	peer.timers.handshakeAttempts.Store(0)
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
+	peer.timers.linkUp.Store(false)
 }
 
 func (peer *Peer) timersStop() {
@@ -218,4 +220,5 @@ func (peer *Peer) timersStop() {
 	peer.timers.newHandshake.DelSync()
 	peer.timers.zeroKeyMaterial.DelSync()
 	peer.timers.persistentKeepalive.DelSync()
+	peer.timers.linkWatchdog.DelSync()
 }

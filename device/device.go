@@ -86,6 +86,9 @@ type Device struct {
 		mtu    atomic.Int32
 	}
 
+	peerEvents             chan PeerEvent
+	linkWatchdogMultiplier atomic.Uint32
+
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
 	log      *Logger
@@ -297,6 +300,8 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.peers.keyMap = make(map[NoisePublicKey]*Peer)
 	device.rate.limiter.Init()
 	device.indexTable.Init()
+	device.peerEvents = make(chan PeerEvent, peerEventQueueSize)
+	device.linkWatchdogMultiplier.Store(defaultLinkWatchdogMultiplier)
 
 	device.PopulatePools()
 
