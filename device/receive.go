@@ -369,6 +369,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
+			peer.kickLinkWatchdog()
 
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.endpoint)
@@ -407,6 +408,7 @@ func (device *Device) RoutineHandshake(id int) {
 
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
+			peer.kickLinkWatchdog()
 
 			// derive keypair
 
@@ -464,6 +466,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 			if len(elem.packet) == 0 {
 				device.log.Verbosef("%v - Receiving keepalive packet", peer)
+				peer.kickLinkWatchdog()
 				continue
 			}
 			dataPacketReceived = true
@@ -516,7 +519,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			peer.keepKeyFreshReceiving()
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
-			peer.kickLinkWatchdog()
 		}
 		if dataPacketReceived {
 			peer.timersDataReceived()
