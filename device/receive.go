@@ -519,6 +519,8 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			peer.keepKeyFreshReceiving()
 			peer.timersAnyAuthenticatedPacketTraversal()
 			peer.timersAnyAuthenticatedPacketReceived()
+			// TODO: Remove the kickLinkWatchdog call when we can be sure that all peers are running a version of wireguard-go with the link watchdog properly integrated with handshakes. For now, we need to kick the watchdog here to avoid false positives in cases where the first authenticated packet we receive from a peer is a handshake initiation or response, which would cause the watchdog to miss it and potentially emit a PeerDown event if no transport packets are received within the keepalive interval.
+			peer.kickLinkWatchdog()
 		}
 		if dataPacketReceived {
 			peer.timersDataReceived()
