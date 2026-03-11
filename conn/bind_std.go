@@ -137,7 +137,7 @@ func listenNet(network string, port int) (*net.UDPConn, int, error) {
 	return conn.(*net.UDPConn), uaddr.Port, nil
 }
 
-func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
+func (s *StdNetBind) Open(uport uint16) ([]ReceiveBorrowedFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -172,14 +172,14 @@ again:
 		v4conn.Close()
 		return nil, 0, err
 	}
-	var fns []ReceiveFunc
+	var fns []ReceiveBorrowedFunc
 	if v4conn != nil {
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
 		}
-		fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
+		fns = append(fns, adaptLegacyReceiveFunc(s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload), s.BatchSize()))
 		s.ipv4 = v4conn
 	}
 	if v6conn != nil {
@@ -188,7 +188,7 @@ again:
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
 		}
-		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
+		fns = append(fns, adaptLegacyReceiveFunc(s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload), s.BatchSize()))
 		s.ipv6 = v6conn
 	}
 	if len(fns) == 0 {
@@ -277,13 +277,13 @@ func (s *StdNetBind) receiveIP(
 	return numMsgs, nil
 }
 
-func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
+func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) legacyReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}
 }
 
-func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
+func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) legacyReceiveFunc {
 	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
 		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
 	}

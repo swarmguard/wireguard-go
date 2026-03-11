@@ -23,6 +23,11 @@ type ChannelBind struct {
 	target4, target6 ChannelEndpoint
 }
 
+type channelBorrowedPacket struct {
+	packet   []byte
+	endpoint conn.Endpoint
+}
+
 type ChannelEndpoint uint16
 
 var (
@@ -67,10 +72,19 @@ func (c ChannelEndpoint) DstIP() netip.Addr { return netip.AddrFrom4([4]byte{127
 
 func (c ChannelEndpoint) SrcIP() netip.Addr { return netip.Addr{} }
 
-func (c *ChannelBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint16, err error) {
+func (p *channelBorrowedPacket) Bytes() []byte { return p.packet }
+
+func (p *channelBorrowedPacket) Endpoint() conn.Endpoint { return p.endpoint }
+
+func (p *channelBorrowedPacket) Release() {
+	p.packet = nil
+	p.endpoint = nil
+}
+
+func (c *ChannelBind) Open(port uint16) (fns []conn.ReceiveBorrowedFunc, actualPort uint16, err error) {
 	c.closeSignal = make(chan bool)
-	fns = append(fns, c.makeReceiveFunc(*c.rx4))
-	fns = append(fns, c.makeReceiveFunc(*c.rx6))
+	fns = append(fns, c.makeReceiveFunc(*c.rx4, c.target4))
+	fns = append(fns, c.makeReceiveFunc(*c.rx6, c.target6))
 	if rand.Uint32()&1 == 0 {
 		return fns, uint16(c.source4), nil
 	} else {
@@ -93,15 +107,16 @@ func (c *ChannelBind) BatchSize() int { return 1 }
 
 func (c *ChannelBind) SetMark(mark uint32) error { return nil }
 
-func (c *ChannelBind) makeReceiveFunc(ch chan []byte) conn.ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []conn.Endpoint) (n int, err error) {
+func (c *ChannelBind) makeReceiveFunc(ch chan []byte, endpoint ChannelEndpoint) conn.ReceiveBorrowedFunc {
+	return func(packets []conn.BorrowedPacket) (n int, err error) {
 		select {
 		case <-c.closeSignal:
 			return 0, net.ErrClosed
 		case rx := <-ch:
-			copied := copy(bufs[0], rx)
-			sizes[0] = copied
-			eps[0] = c.target6
+			packets[0] = &channelBorrowedPacket{
+				packet:   rx,
+				endpoint: endpoint,
+			}
 			return 1, nil
 		}
 	}

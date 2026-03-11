@@ -19,13 +19,18 @@ const (
 	IdealBatchSize = 128 // maximum number of packets handled per read and write
 )
 
-// A ReceiveFunc receives at least one packet from the network and writes them
-// into packets. On a successful read it returns the number of elements of
-// sizes, packets, and endpoints that should be evaluated. Some elements of
-// sizes may be zero, and callers should ignore them. Callers must pass a sizes
-// and eps slice with a length greater than or equal to the length of packets.
-// These lengths must not exceed the length of the associated Bind.BatchSize().
-type ReceiveFunc func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error)
+// A BorrowedPacket exposes a received packet whose backing storage remains
+// owned by the producer until Release is called.
+type BorrowedPacket interface {
+	Bytes() []byte
+	Endpoint() Endpoint
+	Release()
+}
+
+// A ReceiveBorrowedFunc receives at least one packet from the network and
+// writes them into packets. The caller owns the BorrowedPacket values only
+// until Release is called on each packet.
+type ReceiveBorrowedFunc func(packets []BorrowedPacket) (n int, err error)
 
 // A Bind listens on a port for both IPv6 and IPv4 UDP traffic.
 //
@@ -35,7 +40,7 @@ type Bind interface {
 	// Open puts the Bind into a listening state on a given port and reports the actual
 	// port that it bound to. Passing zero results in a random selection.
 	// fns is the set of functions that will be called to receive packets.
-	Open(port uint16) (fns []ReceiveFunc, actualPort uint16, err error)
+	Open(port uint16) (fns []ReceiveBorrowedFunc, actualPort uint16, err error)
 
 	// Close closes the Bind listener.
 	// All fns returned by Open must return net.ErrClosed after a call to Close.
@@ -89,7 +94,7 @@ var (
 	ErrWrongEndpointType = errors.New("endpoint type does not correspond with bind type")
 )
 
-func (fn ReceiveFunc) PrettyName() string {
+func prettyName(fn any) string {
 	name := runtime.FuncForPC(reflect.ValueOf(fn).Pointer()).Name()
 	// 0. cheese/taco.beansIPv6.func12.func21218-fm
 	name = strings.TrimSuffix(name, "-fm")
@@ -130,4 +135,76 @@ func (fn ReceiveFunc) PrettyName() string {
 		return "v6"
 	}
 	return name
+}
+
+func (fn ReceiveBorrowedFunc) PrettyName() string {
+	return prettyName(fn)
+}
+
+const legacyCompatibleReceiveBufferSize = (1 << 16) - 1
+
+type legacyReceiveFunc func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error)
+
+type copiedBorrowedPacket struct {
+	packet   []byte
+	endpoint Endpoint
+}
+
+func (p *copiedBorrowedPacket) Bytes() []byte {
+	return p.packet
+}
+
+func (p *copiedBorrowedPacket) Endpoint() Endpoint {
+	return p.endpoint
+}
+
+func (p *copiedBorrowedPacket) Release() {
+	p.packet = nil
+	p.endpoint = nil
+}
+
+// adaptLegacyReceiveFunc adapts a copy-based receive routine to the borrowed
+// receive API. This preserves compatibility for legacy bind implementations
+// while making borrowed receive the primary interface used by the device.
+func adaptLegacyReceiveFunc(recv legacyReceiveFunc, batchSize int) ReceiveBorrowedFunc {
+	if batchSize < 1 {
+		batchSize = 1
+	}
+
+	bufs := make([][]byte, batchSize)
+	sizes := make([]int, batchSize)
+	eps := make([]Endpoint, batchSize)
+	for i := range bufs {
+		bufs[i] = make([]byte, legacyCompatibleReceiveBufferSize)
+	}
+
+	return func(packets []BorrowedPacket) (int, error) {
+		limit := len(packets)
+		if limit > batchSize {
+			limit = batchSize
+		}
+		for i := 0; i < limit; i++ {
+			packets[i] = nil
+			sizes[i] = 0
+			eps[i] = nil
+		}
+
+		n, err := recv(bufs[:limit], sizes[:limit], eps[:limit])
+		if err != nil {
+			return n, err
+		}
+
+		for i := 0; i < n; i++ {
+			if sizes[i] <= 0 {
+				continue
+			}
+			packet := make([]byte, sizes[i])
+			copy(packet, bufs[i][:sizes[i]])
+			packets[i] = &copiedBorrowedPacket{
+				packet:   packet,
+				endpoint: eps[i],
+			}
+		}
+		return n, nil
+	}
 }

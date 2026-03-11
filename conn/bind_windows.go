@@ -268,7 +268,7 @@ func (bind *afWinRingBind) Open(family int32, sa windows.Sockaddr) (windows.Sock
 	return sa, nil
 }
 
-func (bind *WinRingBind) Open(port uint16) (recvFns []ReceiveFunc, selectedPort uint16, err error) {
+func (bind *WinRingBind) Open(port uint16) (recvFns []ReceiveBorrowedFunc, selectedPort uint16, err error) {
 	bind.mu.Lock()
 	defer bind.mu.Unlock()
 	defer func() {
@@ -300,7 +300,10 @@ func (bind *WinRingBind) Open(port uint16) (recvFns []ReceiveFunc, selectedPort 
 		}
 	}
 	bind.isOpen.Store(1)
-	return []ReceiveFunc{bind.receiveIPv4, bind.receiveIPv6}, selectedPort, err
+	return []ReceiveBorrowedFunc{
+		adaptLegacyReceiveFunc(bind.receiveIPv4, bind.BatchSize()),
+		adaptLegacyReceiveFunc(bind.receiveIPv6, bind.BatchSize()),
+	}, selectedPort, err
 }
 
 func (bind *WinRingBind) Close() error {

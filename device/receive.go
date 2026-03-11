@@ -19,18 +19,20 @@ import (
 )
 
 type QueueHandshakeElement struct {
-	msgType  uint32
-	packet   []byte
-	endpoint conn.Endpoint
-	buffer   *[MaxMessageSize]byte
+	msgType        uint32
+	packet         []byte
+	endpoint       conn.Endpoint
+	buffer         *[MaxMessageSize]byte
+	borrowedPacket conn.BorrowedPacket
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
-	packet   []byte
-	counter  uint64
-	keypair  *Keypair
-	endpoint conn.Endpoint
+	buffer         *[MaxMessageSize]byte
+	packet         []byte
+	counter        uint64
+	keypair        *Keypair
+	endpoint       conn.Endpoint
+	borrowedPacket conn.BorrowedPacket
 }
 
 type QueueInboundElementsContainer struct {
@@ -47,6 +49,40 @@ func (elem *QueueInboundElement) clearPointers() {
 	elem.packet = nil
 	elem.keypair = nil
 	elem.endpoint = nil
+	elem.borrowedPacket = nil
+}
+
+func (elem *QueueHandshakeElement) releasePacket(device *Device) {
+	if elem.borrowedPacket != nil {
+		elem.borrowedPacket.Release()
+		elem.borrowedPacket = nil
+	} else if elem.buffer != nil {
+		device.PutMessageBuffer(elem.buffer)
+		elem.buffer = nil
+	}
+	elem.packet = nil
+	elem.endpoint = nil
+}
+
+func (elem *QueueInboundElement) releasePacket(device *Device) {
+	if elem.borrowedPacket != nil {
+		elem.borrowedPacket.Release()
+		elem.borrowedPacket = nil
+	} else if elem.buffer != nil {
+		device.PutMessageBuffer(elem.buffer)
+		elem.buffer = nil
+	}
+	elem.packet = nil
+}
+
+func (elem *QueueInboundElement) backingBuffer() []byte {
+	if elem.buffer != nil {
+		return elem.buffer[:]
+	}
+	if elem.borrowedPacket != nil {
+		return elem.borrowedPacket.Bytes()
+	}
+	return nil
 }
 
 /* Called when a new authenticated message has been received
@@ -64,12 +100,7 @@ func (peer *Peer) keepKeyFreshReceiving() {
 	}
 }
 
-/* Receives incoming datagrams for the device
- *
- * Every time the bind is updated a new routine is started for
- * IPv4 and IPv6 (separately)
- */
-func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.ReceiveFunc) {
+func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn.ReceiveBorrowedFunc) {
 	recvName := recv.PrettyName()
 	defer func() {
 		device.log.Verbosef("Routine: receive incoming %s - stopped", recvName)
@@ -80,34 +111,16 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 
 	device.log.Verbosef("Routine: receive incoming %s - started", recvName)
 
-	// receive datagrams until conn is closed
-
 	var (
-		bufsArrs    = make([]*[MaxMessageSize]byte, maxBatchSize)
-		bufs        = make([][]byte, maxBatchSize)
+		packets     = make([]conn.BorrowedPacket, maxBatchSize)
 		err         error
-		sizes       = make([]int, maxBatchSize)
 		count       int
-		endpoints   = make([]conn.Endpoint, maxBatchSize)
 		deathSpiral int
 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
 	)
 
-	for i := range bufsArrs {
-		bufsArrs[i] = device.GetMessageBuffer()
-		bufs[i] = bufsArrs[i][:]
-	}
-
-	defer func() {
-		for i := 0; i < maxBatchSize; i++ {
-			if bufsArrs[i] != nil {
-				device.PutMessageBuffer(bufsArrs[i])
-			}
-		}
-	}()
-
 	for {
-		count, err = recv(bufs, sizes, endpoints)
+		count, err = recv(packets)
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return
@@ -125,30 +138,27 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 		}
 		deathSpiral = 0
 
-		// handle each packet in the batch
-		for i, size := range sizes[:count] {
-			if size < MinMessageSize {
+		for i := 0; i < count; i++ {
+			borrowedPacket := packets[i]
+			if borrowedPacket == nil {
+				continue
+			}
+			packet := borrowedPacket.Bytes()
+			if len(packet) < MinMessageSize {
+				borrowedPacket.Release()
+				packets[i] = nil
 				continue
 			}
 
-			// check size of packet
-
-			packet := bufsArrs[i][:size]
 			msgType := binary.LittleEndian.Uint32(packet[:4])
 
 			switch msgType {
-
-			// check if transport
-
 			case MessageTransportType:
-
-				// check size
-
 				if len(packet) < MessageTransportSize {
+					borrowedPacket.Release()
+					packets[i] = nil
 					continue
 				}
-
-				// lookup key pair
 
 				receiver := binary.LittleEndian.Uint32(
 					packet[MessageTransportOffsetReceiver:MessageTransportOffsetCounter],
@@ -156,22 +166,23 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				value := device.indexTable.Lookup(receiver)
 				keypair := value.keypair
 				if keypair == nil {
+					borrowedPacket.Release()
+					packets[i] = nil
 					continue
 				}
-
-				// check keypair expiry
 
 				if keypair.created.Add(RejectAfterTime).Before(time.Now()) {
+					borrowedPacket.Release()
+					packets[i] = nil
 					continue
 				}
 
-				// create work element
 				peer := value.peer
 				elem := device.GetInboundElement()
 				elem.packet = packet
-				elem.buffer = bufsArrs[i]
+				elem.borrowedPacket = borrowedPacket
 				elem.keypair = keypair
-				elem.endpoint = endpoints[i]
+				elem.endpoint = borrowedPacket.Endpoint()
 				elem.counter = 0
 
 				elemsForPeer, ok := elemsByPeer[peer]
@@ -181,42 +192,46 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 					elemsByPeer[peer] = elemsForPeer
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				packets[i] = nil
 				continue
-
-			// otherwise it is a fixed size & handshake related packet
 
 			case MessageInitiationType:
 				if len(packet) != MessageInitiationSize {
+					borrowedPacket.Release()
+					packets[i] = nil
 					continue
 				}
-
 			case MessageResponseType:
 				if len(packet) != MessageResponseSize {
+					borrowedPacket.Release()
+					packets[i] = nil
 					continue
 				}
-
 			case MessageCookieReplyType:
 				if len(packet) != MessageCookieReplySize {
+					borrowedPacket.Release()
+					packets[i] = nil
 					continue
 				}
-
 			default:
 				device.log.Verbosef("Received message with unknown type")
+				borrowedPacket.Release()
+				packets[i] = nil
 				continue
 			}
 
+			handshakeElem := QueueHandshakeElement{
+				msgType:        msgType,
+				packet:         packet,
+				endpoint:       borrowedPacket.Endpoint(),
+				borrowedPacket: borrowedPacket,
+			}
 			select {
-			case device.queue.handshake.c <- QueueHandshakeElement{
-				msgType:  msgType,
-				buffer:   bufsArrs[i],
-				packet:   packet,
-				endpoint: endpoints[i],
-			}:
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+			case device.queue.handshake.c <- handshakeElem:
+				packets[i] = nil
 			default:
+				borrowedPacket.Release()
+				packets[i] = nil
 			}
 		}
 		for peer, elemsContainer := range elemsByPeer {
@@ -225,7 +240,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
 				device.queue.decryption.c <- elemsContainer
 			} else {
 				for _, elem := range elemsContainer.elems {
-					device.PutMessageBuffer(elem.buffer)
+					elem.releasePacket(device)
 					device.PutInboundElement(elem)
 				}
 				device.PutInboundElementsContainer(elemsContainer)
@@ -424,7 +439,7 @@ func (device *Device) RoutineHandshake(id int) {
 			peer.SendKeepalive()
 		}
 	skip:
-		device.PutMessageBuffer(elem.buffer)
+		elem.releasePacket(device)
 	}
 }
 
@@ -510,7 +525,11 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			bufs = append(bufs, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
+			backingBuffer := elem.backingBuffer()
+			if backingBuffer == nil {
+				continue
+			}
+			bufs = append(bufs, backingBuffer[:MessageTransportOffsetContent+len(elem.packet)])
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -530,7 +549,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 		}
 		for _, elem := range elemsContainer.elems {
-			device.PutMessageBuffer(elem.buffer)
+			elem.releasePacket(device)
 			device.PutInboundElement(elem)
 		}
 		bufs = bufs[:0]

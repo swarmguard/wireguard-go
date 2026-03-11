@@ -489,7 +489,7 @@ func (device *Device) BindUpdate() error {
 
 	// bind to new port
 	var err error
-	var recvFns []conn.ReceiveFunc
+	var recvFns []conn.ReceiveBorrowedFunc
 	netc := &device.net
 
 	recvFns, netc.port, err = netc.bind.Open(netc.port)
@@ -521,12 +521,13 @@ func (device *Device) BindUpdate() error {
 	device.peers.RUnlock()
 
 	// start receiving routines
-	device.net.stopping.Add(len(recvFns))
-	device.queue.decryption.wg.Add(len(recvFns)) // each RoutineReceiveIncoming goroutine writes to device.queue.decryption
-	device.queue.handshake.wg.Add(len(recvFns))  // each RoutineReceiveIncoming goroutine writes to device.queue.handshake
+	recvRoutineCount := len(recvFns)
+	device.net.stopping.Add(recvRoutineCount)
+	device.queue.decryption.wg.Add(recvRoutineCount) // each receive goroutine writes to device.queue.decryption
+	device.queue.handshake.wg.Add(recvRoutineCount)  // each receive goroutine writes to device.queue.handshake
 	batchSize := netc.bind.BatchSize()
 	for _, fn := range recvFns {
-		go device.RoutineReceiveIncoming(batchSize, fn)
+		go device.RoutineReceiveIncomingBorrowed(batchSize, fn)
 	}
 
 	device.log.Verbosef("UDP bind has been updated")

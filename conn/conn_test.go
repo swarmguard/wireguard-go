@@ -11,13 +11,13 @@ import (
 
 func TestPrettyName(t *testing.T) {
 	var (
-		recvFunc ReceiveFunc = func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) { return }
+		recvBorrowedFunc ReceiveBorrowedFunc = func(packets []BorrowedPacket) (n int, err error) { return }
 	)
 
 	const want = "TestPrettyName"
 
-	t.Run("ReceiveFunc.PrettyName", func(t *testing.T) {
-		if got := recvFunc.PrettyName(); got != want {
+	t.Run("ReceiveBorrowedFunc.PrettyName", func(t *testing.T) {
+		if got := recvBorrowedFunc.PrettyName(); got != want {
 			t.Errorf("PrettyName() = %v, want %v", got, want)
 		}
 	})
