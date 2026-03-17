@@ -203,6 +203,34 @@ func TestTwoDevicePing(t *testing.T) {
 	})
 }
 
+func TestSendKeepaliveToPeer(t *testing.T) {
+	goroutineLeakCheck(t)
+	pair := genTestPair(t, false)
+
+	var peerKey NoisePublicKey
+	for key := range pair[0].dev.peers.keyMap {
+		peerKey = key
+		break
+	}
+	if peerKey.IsZero() {
+		t.Fatal("expected configured peer key")
+	}
+
+	if !pair[0].dev.SendKeepaliveToPeer(peerKey) {
+		t.Fatal("expected keepalive to be queued for running peer")
+	}
+	if pair[0].dev.SendKeepaliveToPeer(NoisePublicKey{}) {
+		t.Fatal("expected missing peer keepalive request to return false")
+	}
+
+	if err := pair[0].dev.Down(); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if pair[0].dev.SendKeepaliveToPeer(peerKey) {
+		t.Fatal("expected keepalive request on down device to return false")
+	}
+}
+
 func TestUpDown(t *testing.T) {
 	goroutineLeakCheck(t)
 	const itrials = 50

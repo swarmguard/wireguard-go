@@ -350,6 +350,23 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	return device.peers.keyMap[pk]
 }
 
+// SendKeepaliveToPeer queues an immediate keepalive for the peer with the
+// given public key. It returns false if the device is not up, the peer does
+// not exist, or the peer is not currently running.
+func (device *Device) SendKeepaliveToPeer(pk NoisePublicKey) bool {
+	if !device.isUp() {
+		return false
+	}
+
+	peer := device.LookupPeer(pk)
+	if peer == nil || !peer.isRunning.Load() {
+		return false
+	}
+
+	peer.SendKeepalive()
+	return true
+}
+
 func (device *Device) RemovePeer(key NoisePublicKey) {
 	device.peers.Lock()
 	defer device.peers.Unlock()
