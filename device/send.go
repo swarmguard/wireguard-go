@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/crypto/poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
@@ -95,26 +96,26 @@ func (peer *Peer) SendKeepalive() {
 	peer.SendStagedPackets()
 }
 
-func (peer *Peer) sendControlPacket(msgType uint32) error {
+func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error) {
 	if peer == nil || peer.device == nil || !peer.isRunning.Load() {
-		return nil
+		return false, nil
 	}
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil {
-		return nil
+		return false, nil
 	}
 	if keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
-		return nil
+		return false, nil
 	}
 
 	nonceValue := keypair.sendNonce.Add(1) - 1
 	if nonceValue >= RejectAfterMessages {
 		keypair.sendNonce.Store(RejectAfterMessages)
-		return nil
+		return false, nil
 	}
 
-	packet := make([]byte, MessagePeerClosingSize)
+	packet := make([]byte, MessageTransportHeaderSize+len(payload)+poly1305.TagSize)
 	header := packet[:MessageTransportHeaderSize]
 	binary.LittleEndian.PutUint32(header[0:4], msgType)
 	binary.LittleEndian.PutUint32(header[4:8], keypair.remoteIndex)
@@ -122,11 +123,11 @@ func (peer *Peer) sendControlPacket(msgType uint32) error {
 
 	var nonce [chacha20poly1305.NonceSize]byte
 	binary.LittleEndian.PutUint64(nonce[4:], nonceValue)
-	packet = keypair.send.Seal(header, nonce[:], nil, nil)
+	packet = keypair.send.Seal(header, nonce[:], payload, nil)
 
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
-	return peer.SendBuffers([][]byte{packet})
+	return true, peer.SendBuffers([][]byte{packet})
 }
 
 func (peer *Peer) SendPeerClosingNotice() {
@@ -135,7 +136,7 @@ func (peer *Peer) SendPeerClosingNotice() {
 	}
 
 	peer.device.log.Verbosef("%v - Sending peer-closing notice", peer)
-	if err := peer.sendControlPacket(MessagePeerClosingType); err != nil {
+	if _, err := peer.sendControlPacket(MessagePeerClosingType, nil); err != nil {
 		peer.device.log.Verbosef("%v - Failed to send peer-closing notice: %v", peer, err)
 	}
 }

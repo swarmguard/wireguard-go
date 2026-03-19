@@ -61,7 +61,9 @@ const (
 
 	// Note: These messages are not part of the Noise protocol. They are added
 	// by Inalp to enhance the protocol with in-band signaling features.
-	MessagePeerClosingType = 5 // peer-closing notice, sent by a peer to indicate that it is closing the connection.
+	MessagePeerClosingType  = 5 // peer-closing notice, sent by a peer to indicate that it is closing the connection.
+	MessageLatencyProbeType = 6 // latency probe, sent by a peer to measure the current path RTT.
+	MessageLatencyAckType   = 7 // latency probe acknowledgment, echoing the probe token.
 )
 
 const (
@@ -72,7 +74,10 @@ const (
 	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
 	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
 	MessagePeerClosingSize     = MessageTransportSize                          // size of peer-closing notice
-	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
+	MessageLatencyTokenSize    = 8                                             // size of a latency probe token payload
+	MessageLatencyProbeSize    = MessageTransportHeaderSize + MessageLatencyTokenSize + poly1305.TagSize
+	MessageLatencyAckSize      = MessageLatencyProbeSize
+	MessageHandshakeSize       = MessageInitiationSize // size of largest handshake related message
 )
 
 const (

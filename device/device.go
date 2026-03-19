@@ -88,6 +88,7 @@ type Device struct {
 
 	peerEvents             chan PeerEvent
 	linkWatchdogMultiplier atomic.Uint32
+	latencyProbeSeq        atomic.Uint64
 
 	ipcMutex sync.RWMutex
 	closed   chan struct{}
@@ -387,6 +388,27 @@ func (device *Device) SendKeepaliveToPeer(pk NoisePublicKey) bool {
 
 	peer.SendKeepalive()
 	return true
+}
+
+func (device *Device) TriggerLatencyProbeToPeer(pk NoisePublicKey) bool {
+	if !device.isUp() {
+		return false
+	}
+
+	peer := device.LookupPeer(pk)
+	if peer == nil || !peer.isRunning.Load() {
+		return false
+	}
+
+	return peer.triggerLatencyProbe()
+}
+
+func (device *Device) PeerLatency(pk NoisePublicKey) (time.Duration, bool) {
+	peer := device.LookupPeer(pk)
+	if peer == nil {
+		return 0, false
+	}
+	return peer.Latency()
 }
 
 func (device *Device) RemovePeer(key NoisePublicKey) {

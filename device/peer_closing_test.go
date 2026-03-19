@@ -139,7 +139,7 @@ func TestUnknownControlMessageIsIgnored(t *testing.T) {
 	goroutineLeakCheck(t)
 
 	_, _, receiver, senderPeer, receiverPeer := setupEstablishedLink(t)
-	if err := senderPeer.sendControlPacket(MessagePeerClosingType + 100); err != nil {
+	if _, err := senderPeer.sendControlPacket(MessagePeerClosingType+100, nil); err != nil {
 		t.Fatalf("failed to send unknown control packet: %v", err)
 	}
 

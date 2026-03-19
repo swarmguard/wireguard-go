@@ -214,6 +214,8 @@ func (peer *Peer) timersInit() {
 	peer.timers.zeroKeyMaterial = peer.NewTimer(expiredZeroKeyMaterial)
 	peer.timers.persistentKeepalive = peer.NewTimer(expiredPersistentKeepalive)
 	peer.timers.linkWatchdog = peer.NewTimer(expiredLinkWatchdog)
+	peer.timers.latencyProbePeriodic = peer.NewTimer(expiredLatencyProbePeriodic)
+	peer.timers.latencyProbeTimeout = peer.NewTimer(expiredLatencyProbeTimeout)
 }
 
 func (peer *Peer) timersStart() {
@@ -221,7 +223,11 @@ func (peer *Peer) timersStart() {
 	peer.timers.sentLastMinuteHandshake.Store(false)
 	peer.timers.needAnotherKeepalive.Store(false)
 	peer.timers.linkUp.Store(false)
+	peer.resetLatencyProbeState()
 	peer.timersStartPersistentKeepalive()
+	if latencyProbeInterval > 0 {
+		peer.timers.latencyProbePeriodic.Mod(latencyProbeInterval)
+	}
 }
 
 func (peer *Peer) timersStop() {
@@ -231,4 +237,7 @@ func (peer *Peer) timersStop() {
 	peer.timers.zeroKeyMaterial.DelSync()
 	peer.timers.persistentKeepalive.DelSync()
 	peer.timers.linkWatchdog.DelSync()
+	peer.timers.latencyProbePeriodic.DelSync()
+	peer.timers.latencyProbeTimeout.DelSync()
+	peer.resetLatencyProbeState()
 }

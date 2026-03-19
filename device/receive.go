@@ -158,14 +158,29 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 
 			// check if transport
 
-			case MessageTransportType, MessagePeerClosingType:
+			case MessageTransportType, MessagePeerClosingType, MessageLatencyProbeType, MessageLatencyAckType:
 
 				// check size
 
-				if len(packet) < MessageTransportSize {
-					borrowedPacket.Release()
-					packets[i] = nil
-					continue
+				switch msgType {
+				case MessageTransportType, MessagePeerClosingType:
+					if len(packet) < MessageTransportSize {
+						borrowedPacket.Release()
+						packets[i] = nil
+						continue
+					}
+				case MessageLatencyProbeType:
+					if len(packet) != MessageLatencyProbeSize {
+						borrowedPacket.Release()
+						packets[i] = nil
+						continue
+					}
+				case MessageLatencyAckType:
+					if len(packet) != MessageLatencyAckSize {
+						borrowedPacket.Release()
+						packets[i] = nil
+						continue
+					}
 				}
 
 				receiver := binary.LittleEndian.Uint32(
@@ -490,6 +505,25 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			if elem.msgType == MessagePeerClosingType {
 				device.log.Verbosef("%v - Received peer-closing notice", peer)
 				peer.notePeerClosing()
+				continue
+			}
+
+			if elem.msgType == MessageLatencyProbeType || elem.msgType == MessageLatencyAckType {
+				token, ok := decodeLatencyToken(elem.packet)
+				if !ok {
+					continue
+				}
+
+				validTailPacket = i
+				peer.kickLinkWatchdog()
+				switch elem.msgType {
+				case MessageLatencyProbeType:
+					device.log.Verbosef("%v - Received latency probe", peer)
+					peer.handleLatencyProbe(token)
+				case MessageLatencyAckType:
+					device.log.Verbosef("%v - Received latency probe ack", peer)
+					peer.handleLatencyAck(token)
+				}
 				continue
 			}
 

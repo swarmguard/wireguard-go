@@ -39,6 +39,8 @@ type Peer struct {
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
 		linkWatchdog            *Timer
+		latencyProbePeriodic    *Timer
+		latencyProbeTimeout     *Timer
 		handshakeAttempts       atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
 		sentLastMinuteHandshake atomic.Bool
@@ -53,6 +55,18 @@ type Peer struct {
 		staged   chan *QueueOutboundElementsContainer // staged packets before a handshake is available
 		outbound *autodrainingOutboundQueue           // sequential ordering of udp transmission
 		inbound  *autodrainingInboundQueue            // sequential ordering of tun writing
+	}
+
+	latency struct {
+		lastNanos  atomic.Int64
+		lastAtNano atomic.Int64
+		valid      atomic.Bool
+
+		sync.Mutex
+		active  bool
+		pending bool
+		token   uint64
+		sentAt  time.Time
 	}
 
 	cookieGenerator             CookieGenerator
