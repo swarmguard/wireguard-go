@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	latencyProbeInterval = 5 * time.Minute
+	latencyProbeInterval = 15 * time.Second
 	latencyProbeTimeout  = 5 * time.Second
 )
 
