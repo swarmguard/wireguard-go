@@ -36,6 +36,28 @@ func waitForPeerLatency(tb testing.TB, dev *Device, pk NoisePublicKey, timeout t
 	}
 }
 
+func waitForBindCount(tb testing.TB, bind *recordingBind, msgType uint32, want int, timeout time.Duration) {
+	tb.Helper()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if bind.count(msgType) >= want {
+			return
+		}
+
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			tb.Fatalf("timed out waiting for %d packets of type %d, got %d", want, msgType, bind.count(msgType))
+		}
+	}
+}
+
 type recordingBind struct {
 	sendTypes []uint32
 }
@@ -104,7 +126,7 @@ func newLatencyTestPeer(tb testing.TB) (*Peer, *recordingBind) {
 func TestLatencyProbeStoresSampleWithoutTouchingTUN(t *testing.T) {
 	goroutineLeakCheck(t)
 
-	_, sender, receiver, _, _ := setupEstablishedLink(t)
+	_, sender, receiver, senderPeer, receiverPeer := setupEstablishedLink(t)
 	peerKey := receiver.dev.staticIdentity.publicKey
 
 	if _, ok := sender.dev.PeerLatency(peerKey); ok {
@@ -118,6 +140,9 @@ func TestLatencyProbeStoresSampleWithoutTouchingTUN(t *testing.T) {
 	if latency <= 0 {
 		t.Fatalf("expected positive latency sample, got %s", latency)
 	}
+
+	_ = senderPeer
+	_ = receiverPeer
 
 	assertNoInboundPacket(t, sender, 200*time.Millisecond)
 	assertNoInboundPacket(t, receiver, 200*time.Millisecond)
@@ -173,6 +198,40 @@ func TestLatencyProbePendingFollowUpSendsExactlyOneAdditionalProbe(t *testing.T)
 	if got := bind.count(MessageLatencyProbeType); got != 2 {
 		t.Fatalf("unexpected latency probe send count: got %d want 2", got)
 	}
+}
+
+func TestLatencyProbeRetriesShortlyWhenSessionIsNotReady(t *testing.T) {
+	previousRetryDelays := latencyProbeRetryDelays
+	latencyProbeRetryDelays = []time.Duration{
+		20 * time.Millisecond,
+		40 * time.Millisecond,
+	}
+	t.Cleanup(func() { latencyProbeRetryDelays = previousRetryDelays })
+
+	peer, bind := newLatencyTestPeer(t)
+
+	peer.keypairs.Lock()
+	peer.keypairs.current = nil
+	peer.keypairs.Unlock()
+
+	if !peer.triggerLatencyProbe() {
+		t.Fatal("expected latency probe trigger to schedule a retry")
+	}
+	if got := bind.count(MessageLatencyProbeType); got != 0 {
+		t.Fatalf("expected no immediate probe send without a keypair, got %d", got)
+	}
+
+	time.Sleep(5 * time.Millisecond)
+
+	peer.keypairs.Lock()
+	peer.keypairs.current = &Keypair{
+		send:        newTestAEAD(t),
+		created:     time.Now(),
+		remoteIndex: 1,
+	}
+	peer.keypairs.Unlock()
+
+	waitForBindCount(t, bind, MessageLatencyProbeType, 1, 200*time.Millisecond)
 }
 
 func TestPeriodicLatencyProbeRunsOnlyWhileLinkUp(t *testing.T) {

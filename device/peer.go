@@ -40,6 +40,7 @@ type Peer struct {
 		persistentKeepalive     *Timer
 		linkWatchdog            *Timer
 		latencyProbePeriodic    *Timer
+		latencyProbeRetry       *Timer
 		latencyProbeTimeout     *Timer
 		handshakeAttempts       atomic.Uint32
 		needAnotherKeepalive    atomic.Bool
@@ -63,10 +64,11 @@ type Peer struct {
 		valid      atomic.Bool
 
 		sync.Mutex
-		active  bool
-		pending bool
-		token   uint64
-		sentAt  time.Time
+		active       bool
+		pending      bool
+		token        uint64
+		sentAt       time.Time
+		retryAttempt int
 	}
 
 	cookieGenerator             CookieGenerator

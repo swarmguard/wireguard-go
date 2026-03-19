@@ -215,6 +215,7 @@ func (peer *Peer) timersInit() {
 	peer.timers.persistentKeepalive = peer.NewTimer(expiredPersistentKeepalive)
 	peer.timers.linkWatchdog = peer.NewTimer(expiredLinkWatchdog)
 	peer.timers.latencyProbePeriodic = peer.NewTimer(expiredLatencyProbePeriodic)
+	peer.timers.latencyProbeRetry = peer.NewTimer(expiredLatencyProbeRetry)
 	peer.timers.latencyProbeTimeout = peer.NewTimer(expiredLatencyProbeTimeout)
 }
 
@@ -238,6 +239,7 @@ func (peer *Peer) timersStop() {
 	peer.timers.persistentKeepalive.DelSync()
 	peer.timers.linkWatchdog.DelSync()
 	peer.timers.latencyProbePeriodic.DelSync()
+	peer.timers.latencyProbeRetry.DelSync()
 	peer.timers.latencyProbeTimeout.DelSync()
 	peer.resetLatencyProbeState()
 }

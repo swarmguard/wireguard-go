@@ -11,8 +11,13 @@ import (
 )
 
 var (
-	latencyProbeInterval = 15 * time.Second
-	latencyProbeTimeout  = 5 * time.Second
+	latencyProbeInterval    = 15 * time.Second
+	latencyProbeTimeout     = 5 * time.Second
+	latencyProbeRetryDelays = []time.Duration{
+		250 * time.Millisecond,
+		500 * time.Millisecond,
+		1 * time.Second,
+	}
 )
 
 func encodeLatencyToken(token uint64) []byte {
@@ -51,20 +56,38 @@ func (peer *Peer) resetLatencyProbeState() {
 	if peer == nil {
 		return
 	}
+	if peer.timers.latencyProbeRetry != nil {
+		peer.timers.latencyProbeRetry.Del()
+	}
 	peer.latency.Lock()
 	peer.latency.active = false
 	peer.latency.pending = false
 	peer.latency.token = 0
 	peer.latency.sentAt = time.Time{}
+	peer.latency.retryAttempt = 0
 	peer.latency.Unlock()
 }
 
 func (peer *Peer) triggerLatencyProbe() bool {
-	if peer == nil || peer.device == nil || !peer.isRunning.Load() || !peer.device.isUp() {
+	return peer.triggerLatencyProbeWithRetry(true, false)
+}
+
+func (peer *Peer) triggerLatencyProbeWithRetry(allowRetry, isRetryAttempt bool) bool {
+	if peer == nil || peer.device == nil {
+		return false
+	}
+
+	if !peer.isRunning.Load() || !peer.device.isUp() {
 		return false
 	}
 
 	peer.latency.Lock()
+	if allowRetry && !isRetryAttempt {
+		peer.latency.retryAttempt = 0
+		if peer.timers.latencyProbeRetry != nil {
+			peer.timers.latencyProbeRetry.Del()
+		}
+	}
 	if peer.latency.active {
 		peer.latency.pending = true
 		peer.latency.Unlock()
@@ -85,8 +108,12 @@ func (peer *Peer) triggerLatencyProbe() bool {
 	}
 	if !sent || err != nil {
 		peer.completeLatencyProbe(token, false)
+		if allowRetry {
+			return peer.scheduleLatencyProbeRetry()
+		}
 		return false
 	}
+	peer.clearLatencyProbeRetry()
 
 	if latencyProbeTimeout > 0 {
 		peer.timers.latencyProbeTimeout.Mod(latencyProbeTimeout)
@@ -103,8 +130,9 @@ func (peer *Peer) handleLatencyProbe(token uint64) {
 	if err != nil {
 		peer.device.log.Verbosef("%v - Failed to send latency ack: %v", peer, err)
 	}
-	if !sent {
+	if !sent || err != nil {
 		peer.device.log.Verbosef("%v - Skipped latency ack: no active session", peer)
+		return
 	}
 }
 
@@ -165,8 +193,40 @@ func (peer *Peer) completeLatencyProbe(token uint64, stopTimer bool) {
 	peer.latency.Unlock()
 
 	if followUp {
-		peer.triggerLatencyProbe()
+		peer.triggerLatencyProbeWithRetry(true, false)
 	}
+}
+
+func (peer *Peer) scheduleLatencyProbeRetry() bool {
+	if peer == nil || !peer.timersActive() || peer.timers.latencyProbeRetry == nil {
+		return false
+	}
+
+	peer.latency.Lock()
+	attempt := peer.latency.retryAttempt
+	if attempt < 0 || attempt >= len(latencyProbeRetryDelays) {
+		peer.latency.Unlock()
+		return false
+	}
+	delay := latencyProbeRetryDelays[attempt]
+	peer.latency.retryAttempt++
+	peer.latency.Unlock()
+
+	peer.timers.latencyProbeRetry.Mod(delay)
+	return true
+}
+
+func (peer *Peer) clearLatencyProbeRetry() {
+	if peer == nil {
+		return
+	}
+
+	if peer.timers.latencyProbeRetry != nil {
+		peer.timers.latencyProbeRetry.Del()
+	}
+	peer.latency.Lock()
+	peer.latency.retryAttempt = 0
+	peer.latency.Unlock()
 }
 
 func expiredLatencyProbePeriodic(peer *Peer) {
@@ -179,8 +239,15 @@ func expiredLatencyProbePeriodic(peer *Peer) {
 	}
 
 	if peer.timersActive() && peer.timers.linkUp.Load() {
-		peer.triggerLatencyProbe()
+		peer.triggerLatencyProbeWithRetry(false, false)
 	}
+}
+
+func expiredLatencyProbeRetry(peer *Peer) {
+	if peer == nil {
+		return
+	}
+	peer.triggerLatencyProbeWithRetry(true, true)
 }
 
 func expiredLatencyProbeTimeout(peer *Peer) {
