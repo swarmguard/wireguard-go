@@ -58,6 +58,11 @@ type Peer struct {
 	cookieGenerator             CookieGenerator
 	trieEntries                 list.List
 	persistentKeepaliveInterval atomic.Uint32
+
+	userData struct {
+		sync.RWMutex
+		value any
+	}
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
@@ -256,6 +261,28 @@ func (peer *Peer) ExpireCurrentKeypairs() {
 		next.sendNonce.Store(RejectAfterMessages)
 	}
 	keypairs.Unlock()
+}
+
+// SetUserData attaches caller-defined metadata to the peer. This is useful
+// for higher layers that need a direct association between device peers and
+// their own peer representations.
+func (peer *Peer) SetUserData(value any) {
+	if peer == nil {
+		return
+	}
+	peer.userData.Lock()
+	peer.userData.value = value
+	peer.userData.Unlock()
+}
+
+// UserData returns metadata previously attached via SetUserData.
+func (peer *Peer) UserData() any {
+	if peer == nil {
+		return nil
+	}
+	peer.userData.RLock()
+	defer peer.userData.RUnlock()
+	return peer.userData.value
 }
 
 func (peer *Peer) Stop() {

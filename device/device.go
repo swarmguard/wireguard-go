@@ -130,6 +130,9 @@ func (device *Device) isUp() bool {
 
 // Must hold device.peers.Lock()
 func removePeerLocked(device *Device, peer *Peer, key NoisePublicKey) {
+	// send a peer-closing notice before stopping the peer
+	peer.SendPeerClosingNotice()
+
 	// stop routing and processing of packets
 	device.allowedips.RemoveByPeer(peer)
 	peer.Stop()
@@ -160,7 +163,7 @@ func (device *Device) changeState(want deviceState) (err error) {
 		fallthrough // up failed; bring the device all the way back down
 	case deviceStateDown:
 		device.state.state.Store(uint32(deviceStateDown))
-		errDown := device.downLocked()
+		errDown := device.downLocked(want == deviceStateDown)
 		if err == nil {
 			err = errDown
 		}
@@ -195,7 +198,13 @@ func (device *Device) upLocked() error {
 
 // downLocked attempts to bring the device down.
 // The caller must hold device.state.mu and is responsible for updating device.state.state.
-func (device *Device) downLocked() error {
+func (device *Device) downLocked(sendPeerClosingNotices bool) error {
+	// send peer-closing notices before stopping the peers, so that they have a
+	// chance to respond to the notice and close their connections gracefully
+	if sendPeerClosingNotices {
+		device.notifyPeersClosing()
+	}
+
 	err := device.BindClose()
 	if err != nil {
 		device.log.Errorf("Bind close failed: %v", err)
@@ -207,6 +216,19 @@ func (device *Device) downLocked() error {
 	}
 	device.peers.RUnlock()
 	return err
+}
+
+func (device *Device) notifyPeersClosing() {
+	device.peers.RLock()
+	peers := make([]*Peer, 0, len(device.peers.keyMap))
+	for _, peer := range device.peers.keyMap {
+		peers = append(peers, peer)
+	}
+	device.peers.RUnlock()
+
+	for _, peer := range peers {
+		peer.SendPeerClosingNotice()
+	}
 }
 
 func (device *Device) Up() error {
@@ -397,11 +419,13 @@ func (device *Device) Close() {
 	if device.isClosed() {
 		return
 	}
+
+	device.notifyPeersClosing()
 	device.state.state.Store(uint32(deviceStateClosed))
 	device.log.Verbosef("Device closing")
 
 	device.tun.device.Close()
-	device.downLocked()
+	device.downLocked(false)
 
 	// Remove peers before closing queues,
 	// because peers assume that queues are active.

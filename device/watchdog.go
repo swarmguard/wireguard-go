@@ -74,6 +74,17 @@ func expiredLinkWatchdog(peer *Peer) {
 	}
 }
 
+// notePeerClosing marks the peer down immediately after receiving an
+// authenticated peer-closing notice from the remote side.
+func (peer *Peer) notePeerClosing() {
+	if peer == nil || peer.device == nil {
+		return
+	}
+	if peer.timers.linkUp.Swap(false) {
+		peer.device.emitPeerEvent(PeerEvent{Type: PeerEventDown, Peer: peer, Key: peerPublicKey(peer)})
+	}
+}
+
 // kickLinkWatchdog is called when a transport packet is received from the
 // peer.
 func (peer *Peer) kickLinkWatchdog() {

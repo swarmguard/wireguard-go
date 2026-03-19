@@ -58,6 +58,10 @@ const (
 	MessageResponseType    = 2
 	MessageCookieReplyType = 3
 	MessageTransportType   = 4
+
+	// Note: These messages are not part of the Noise protocol. They are added
+	// by Inalp to enhance the protocol with in-band signaling features.
+	MessagePeerClosingType = 5 // peer-closing notice, sent by a peer to indicate that it is closing the connection.
 )
 
 const (
@@ -67,6 +71,7 @@ const (
 	MessageTransportHeaderSize = 16                                            // size of data preceding content in transport message
 	MessageTransportSize       = MessageTransportHeaderSize + poly1305.TagSize // size of empty transport
 	MessageKeepaliveSize       = MessageTransportSize                          // size of keepalive
+	MessagePeerClosingSize     = MessageTransportSize                          // size of peer-closing notice
 	MessageHandshakeSize       = MessageInitiationSize                         // size of largest handshake related message
 )
 

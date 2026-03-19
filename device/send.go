@@ -95,6 +95,51 @@ func (peer *Peer) SendKeepalive() {
 	peer.SendStagedPackets()
 }
 
+func (peer *Peer) sendControlPacket(msgType uint32) error {
+	if peer == nil || peer.device == nil || !peer.isRunning.Load() {
+		return nil
+	}
+
+	keypair := peer.keypairs.Current()
+	if keypair == nil {
+		return nil
+	}
+	if keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+		return nil
+	}
+
+	nonceValue := keypair.sendNonce.Add(1) - 1
+	if nonceValue >= RejectAfterMessages {
+		keypair.sendNonce.Store(RejectAfterMessages)
+		return nil
+	}
+
+	packet := make([]byte, MessagePeerClosingSize)
+	header := packet[:MessageTransportHeaderSize]
+	binary.LittleEndian.PutUint32(header[0:4], msgType)
+	binary.LittleEndian.PutUint32(header[4:8], keypair.remoteIndex)
+	binary.LittleEndian.PutUint64(header[8:16], nonceValue)
+
+	var nonce [chacha20poly1305.NonceSize]byte
+	binary.LittleEndian.PutUint64(nonce[4:], nonceValue)
+	packet = keypair.send.Seal(header, nonce[:], nil, nil)
+
+	peer.timersAnyAuthenticatedPacketTraversal()
+	peer.timersAnyAuthenticatedPacketSent()
+	return peer.SendBuffers([][]byte{packet})
+}
+
+func (peer *Peer) SendPeerClosingNotice() {
+	if peer == nil || peer.device == nil {
+		return
+	}
+
+	peer.device.log.Verbosef("%v - Sending peer-closing notice", peer)
+	if err := peer.sendControlPacket(MessagePeerClosingType); err != nil {
+		peer.device.log.Verbosef("%v - Failed to send peer-closing notice: %v", peer, err)
+	}
+}
+
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)

@@ -33,6 +33,7 @@ type QueueInboundElement struct {
 	keypair        *Keypair
 	endpoint       conn.Endpoint
 	borrowedPacket conn.BorrowedPacket
+	msgType        uint32
 }
 
 type QueueInboundElementsContainer struct {
@@ -50,6 +51,7 @@ func (elem *QueueInboundElement) clearPointers() {
 	elem.keypair = nil
 	elem.endpoint = nil
 	elem.borrowedPacket = nil
+	elem.msgType = 0
 }
 
 func (elem *QueueHandshakeElement) releasePacket(device *Device) {
@@ -153,7 +155,13 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 			msgType := binary.LittleEndian.Uint32(packet[:4])
 
 			switch msgType {
-			case MessageTransportType:
+
+			// check if transport
+
+			case MessageTransportType, MessagePeerClosingType:
+
+				// check size
+
 				if len(packet) < MessageTransportSize {
 					borrowedPacket.Release()
 					packets[i] = nil
@@ -184,6 +192,7 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 				elem.keypair = keypair
 				elem.endpoint = borrowedPacket.Endpoint()
 				elem.counter = 0
+				elem.msgType = msgType
 
 				elemsForPeer, ok := elemsByPeer[peer]
 				if !ok {
@@ -471,7 +480,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			validTailPacket = i
 			if peer.ReceivedWithKeypair(elem.keypair) {
 				peer.SetEndpointFromPacket(elem.endpoint)
 				peer.timersHandshakeComplete()
@@ -479,6 +487,13 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
+			if elem.msgType == MessagePeerClosingType {
+				device.log.Verbosef("%v - Received peer-closing notice", peer)
+				peer.notePeerClosing()
+				continue
+			}
+
+			validTailPacket = i
 			if len(elem.packet) == 0 {
 				device.log.Verbosef("%v - Receiving keepalive packet", peer)
 				peer.kickLinkWatchdog()
