@@ -39,6 +39,7 @@ type Peer struct {
 		zeroKeyMaterial         *Timer
 		persistentKeepalive     *Timer
 		linkWatchdog            *Timer
+		linkWatchdogProbe       *Timer
 		latencyProbePeriodic    *Timer
 		latencyProbeRetry       *Timer
 		latencyProbeTimeout     *Timer

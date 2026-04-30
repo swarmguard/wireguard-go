@@ -67,11 +67,30 @@ func (device *Device) emitPeerEvent(event PeerEvent) {
 	}
 }
 
-// expiredLinkWatchdog is called when a peer's link watchdog timer expires.
+// expiredLinkWatchdog is called when a peer's link watchdog timer expires.  It
+// marks the peer as down and emits a PeerDown event if the peer was previously
+// up. Peers that receive a transport packet just before the watchdog expires
+// can avoid being marked down by sending a link watchdog probe in
+// expiredLinkWatchdogProbe.
 func expiredLinkWatchdog(peer *Peer) {
-	if peer.timersActive() && peer.timers.linkUp.Swap(false) {
-		peer.device.emitPeerEvent(PeerEvent{Type: PeerEventDown, Peer: peer, Key: peerPublicKey(peer)})
+	if !peer.timersActive() || peer.linkWatchdogInterval() == 0 {
+		return
 	}
+	if !peer.timers.linkUp.Swap(false) {
+		return
+	}
+	peer.timers.linkWatchdogProbe.Del()
+	peer.device.emitPeerEvent(PeerEvent{Type: PeerEventDown, Peer: peer, Key: peerPublicKey(peer)})
+}
+
+// expiredLinkWatchdogProbe is called before the link watchdog expires. It sends
+// a one-shot latency probe so mobile peers can prove liveness before the hard
+// watchdog deadline without extending that deadline.
+func expiredLinkWatchdogProbe(peer *Peer) {
+	if !peer.timersActive() || peer.linkWatchdogInterval() == 0 || !peer.timers.linkUp.Load() {
+		return
+	}
+	peer.sendLinkWatchdogProbe()
 }
 
 // notePeerClosing marks the peer down immediately after receiving an
@@ -81,6 +100,7 @@ func (peer *Peer) notePeerClosing() {
 		return
 	}
 	if peer.timers.linkUp.Swap(false) {
+		peer.timers.linkWatchdogProbe.Del()
 		peer.device.emitPeerEvent(PeerEvent{Type: PeerEventDown, Peer: peer, Key: peerPublicKey(peer)})
 	}
 }
@@ -94,6 +114,8 @@ func (peer *Peer) kickLinkWatchdog() {
 
 	interval := peer.linkWatchdogInterval()
 	if interval == 0 {
+		peer.timers.linkWatchdog.Del()
+		peer.timers.linkWatchdogProbe.Del()
 		return
 	}
 
@@ -102,6 +124,11 @@ func (peer *Peer) kickLinkWatchdog() {
 	}
 
 	peer.timers.linkWatchdog.Mod(interval)
+	if probeInterval := linkWatchdogProbeInterval(interval); probeInterval > 0 {
+		peer.timers.linkWatchdogProbe.Mod(probeInterval)
+	} else {
+		peer.timers.linkWatchdogProbe.Del()
+	}
 }
 
 // linkWatchdogInterval returns the current link watchdog interval for the peer.
@@ -117,6 +144,31 @@ func (peer *Peer) linkWatchdogInterval() time.Duration {
 	}
 
 	return interval * time.Duration(multiplier)
+}
+
+// linkWatchdogProbeInterval returns the pre-expiry active probe delay for a
+// full watchdog interval.
+func linkWatchdogProbeInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return interval * 2 / 3
+}
+
+// sendLinkWatchdogProbe sends a liveness-only latency probe without touching
+// latency measurement state. The received ack still kicks the watchdog in the
+// normal receive path.
+func (peer *Peer) sendLinkWatchdogProbe() bool {
+	if peer == nil || peer.device == nil {
+		return false
+	}
+
+	token := peer.device.latencyProbeSeq.Add(1)
+	sent, err := peer.sendControlPacket(MessageLatencyProbeType, encodeLatencyToken(token))
+	if err != nil {
+		peer.device.log.Verbosef("%v - Failed to send link watchdog probe: %v", peer, err)
+	}
+	return sent && err == nil
 }
 
 // peerPublicKey returns the peer's static public key.
