@@ -60,6 +60,7 @@ func waitForBindCount(tb testing.TB, bind *recordingBind, msgType uint32, want i
 
 type recordingBind struct {
 	sendTypes []uint32
+	sendErr   error
 }
 
 func (b *recordingBind) Open(port uint16) ([]conn.ReceiveBorrowedFunc, uint16, error) {
@@ -67,9 +68,12 @@ func (b *recordingBind) Open(port uint16) ([]conn.ReceiveBorrowedFunc, uint16, e
 }
 func (b *recordingBind) Close() error                                  { return nil }
 func (b *recordingBind) SetMark(mark uint32) error                     { return nil }
-func (b *recordingBind) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
+func (b *recordingBind) ParseEndpoint(s string) (conn.Endpoint, error) { return &DummyEndpoint{}, nil }
 func (b *recordingBind) BatchSize() int                                { return 1 }
 func (b *recordingBind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	if b.sendErr != nil {
+		return b.sendErr
+	}
 	for _, buf := range bufs {
 		if len(buf) >= 4 {
 			b.sendTypes = append(b.sendTypes, uint32(buf[0])|uint32(buf[1])<<8|uint32(buf[2])<<16|uint32(buf[3])<<24)

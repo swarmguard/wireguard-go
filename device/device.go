@@ -373,6 +373,46 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 	return device.peers.keyMap[pk]
 }
 
+type HandshakeAttemptOutcome string
+
+const (
+	HandshakeAttemptSent        HandshakeAttemptOutcome = "sent"
+	HandshakeAttemptThrottled   HandshakeAttemptOutcome = "throttled"
+	HandshakeAttemptPeerMissing HandshakeAttemptOutcome = "peer-missing"
+	HandshakeAttemptPeerStopped HandshakeAttemptOutcome = "peer-stopped"
+	HandshakeAttemptDeviceDown  HandshakeAttemptOutcome = "device-down"
+	HandshakeAttemptNoEndpoint  HandshakeAttemptOutcome = "no-endpoint"
+	HandshakeAttemptWriteError  HandshakeAttemptOutcome = "write-error"
+)
+
+type HandshakeAttemptResult struct {
+	Outcome HandshakeAttemptOutcome
+	Err     error
+}
+
+func (r HandshakeAttemptResult) Sent() bool {
+	return r.Outcome == HandshakeAttemptSent
+}
+
+// ForceHandshakeToPeer sends a WireGuard handshake initiation to the peer with
+// the given public key. If bypassThrottle is true, the regular RekeyTimeout
+// throttle is bypassed for this call.
+func (device *Device) ForceHandshakeToPeer(pk NoisePublicKey, bypassThrottle bool) HandshakeAttemptResult {
+	if !device.isUp() {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptDeviceDown}
+	}
+
+	peer := device.LookupPeer(pk)
+	if peer == nil {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptPeerMissing}
+	}
+	if !peer.isRunning.Load() {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptPeerStopped}
+	}
+
+	return peer.forceHandshakeInitiation(bypassThrottle)
+}
+
 // SendKeepaliveToPeer queues an immediate keepalive for the peer with the
 // given public key. It returns false if the device is not up, the peer does
 // not exist, or the peer is not currently running.

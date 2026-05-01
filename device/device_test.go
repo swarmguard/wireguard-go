@@ -8,6 +8,7 @@ package device
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -228,6 +229,158 @@ func TestSendKeepaliveToPeer(t *testing.T) {
 	}
 	if pair[0].dev.SendKeepaliveToPeer(peerKey) {
 		t.Fatal("expected keepalive request on down device to return false")
+	}
+}
+
+func newForceHandshakeTestDevice(tb testing.TB) (*Device, *Peer, NoisePublicKey, *recordingBind) {
+	tb.Helper()
+
+	cfgs, _ := genConfigs(tb)
+	bind := &recordingBind{}
+	tunDev := tuntest.NewChannelTUN()
+	dev := NewDevice(tunDev.TUN(), bind, NewLogger(LogLevelError, "force-handshake-test: "))
+	if err := dev.IpcSet(cfgs[0]); err != nil {
+		tb.Fatalf("IpcSet: %v", err)
+	}
+	if err := dev.Up(); err != nil {
+		tb.Fatalf("Up: %v", err)
+	}
+	tb.Cleanup(dev.Close)
+
+	var peerKey NoisePublicKey
+	var peer *Peer
+	for key, candidate := range dev.peers.keyMap {
+		peerKey = key
+		peer = candidate
+		break
+	}
+	if peer == nil {
+		tb.Fatal("expected configured peer")
+	}
+
+	peer.endpoint.Lock()
+	peer.endpoint.val = &DummyEndpoint{}
+	peer.endpoint.Unlock()
+
+	return dev, peer, peerKey, bind
+}
+
+func TestForceHandshakeToPeerSendsWithoutKeypair(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	dev, peer, peerKey, bind := newForceHandshakeTestDevice(t)
+
+	peer.keypairs.RLock()
+	current := peer.keypairs.current
+	peer.keypairs.RUnlock()
+	if current != nil {
+		t.Fatal("expected no current keypair before forced handshake")
+	}
+
+	result := dev.ForceHandshakeToPeer(peerKey, true)
+	if result.Outcome != HandshakeAttemptSent {
+		t.Fatalf("unexpected forced handshake outcome: %+v", result)
+	}
+	if got := bind.count(MessageInitiationType); got != 1 {
+		t.Fatalf("unexpected handshake initiation count: got %d want 1", got)
+	}
+}
+
+func TestForceHandshakeToPeerBypassesThrottle(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	dev, _, peerKey, bind := newForceHandshakeTestDevice(t)
+
+	first := dev.ForceHandshakeToPeer(peerKey, true)
+	if first.Outcome != HandshakeAttemptSent {
+		t.Fatalf("unexpected first forced handshake outcome: %+v", first)
+	}
+
+	throttled := dev.ForceHandshakeToPeer(peerKey, false)
+	if throttled.Outcome != HandshakeAttemptThrottled {
+		t.Fatalf("unexpected throttled handshake outcome: %+v", throttled)
+	}
+
+	bypassed := dev.ForceHandshakeToPeer(peerKey, true)
+	if bypassed.Outcome != HandshakeAttemptSent {
+		t.Fatalf("unexpected bypassed handshake outcome: %+v", bypassed)
+	}
+
+	if got := bind.count(MessageInitiationType); got != 2 {
+		t.Fatalf("unexpected handshake initiation count: got %d want 2", got)
+	}
+}
+
+func TestForceHandshakeToPeerReportsUnavailableStates(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	dev, peer, peerKey, _ := newForceHandshakeTestDevice(t)
+
+	if got := dev.ForceHandshakeToPeer(NoisePublicKey{}, true).Outcome; got != HandshakeAttemptPeerMissing {
+		t.Fatalf("unexpected missing-peer outcome: got %s want %s", got, HandshakeAttemptPeerMissing)
+	}
+
+	peer.Stop()
+	if got := dev.ForceHandshakeToPeer(peerKey, true).Outcome; got != HandshakeAttemptPeerStopped {
+		t.Fatalf("unexpected stopped-peer outcome: got %s want %s", got, HandshakeAttemptPeerStopped)
+	}
+
+	dev, _, peerKey, _ = newForceHandshakeTestDevice(t)
+	if err := dev.Down(); err != nil {
+		t.Fatalf("Down: %v", err)
+	}
+	if got := dev.ForceHandshakeToPeer(peerKey, true).Outcome; got != HandshakeAttemptDeviceDown {
+		t.Fatalf("unexpected device-down outcome: got %s want %s", got, HandshakeAttemptDeviceDown)
+	}
+}
+
+func TestForceHandshakeToPeerReportsSendFailures(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	dev, peer, peerKey, bind := newForceHandshakeTestDevice(t)
+
+	peer.endpoint.Lock()
+	peer.endpoint.val = nil
+	peer.endpoint.Unlock()
+
+	noEndpoint := dev.ForceHandshakeToPeer(peerKey, true)
+	if noEndpoint.Outcome != HandshakeAttemptNoEndpoint {
+		t.Fatalf("unexpected no-endpoint outcome: %+v", noEndpoint)
+	}
+	if !errors.Is(noEndpoint.Err, ErrNoKnownEndpoint) {
+		t.Fatalf("expected ErrNoKnownEndpoint, got %v", noEndpoint.Err)
+	}
+
+	peer.endpoint.Lock()
+	peer.endpoint.val = &DummyEndpoint{}
+	peer.endpoint.Unlock()
+
+	sendErr := errors.New("write failed")
+	bind.sendErr = sendErr
+	writeError := dev.ForceHandshakeToPeer(peerKey, true)
+	if writeError.Outcome != HandshakeAttemptWriteError {
+		t.Fatalf("unexpected write-error outcome: %+v", writeError)
+	}
+	if !errors.Is(writeError.Err, sendErr) {
+		t.Fatalf("expected send error, got %v", writeError.Err)
+	}
+}
+
+func TestSendHandshakeInitiationNoEndpointKeepsRetryTimerBehavior(t *testing.T) {
+	goroutineLeakCheck(t)
+
+	_, peer, _, _ := newForceHandshakeTestDevice(t)
+
+	peer.endpoint.Lock()
+	peer.endpoint.val = nil
+	peer.endpoint.Unlock()
+
+	err := peer.SendHandshakeInitiation(false)
+	if !errors.Is(err, ErrNoKnownEndpoint) {
+		t.Fatalf("expected ErrNoKnownEndpoint, got %v", err)
+	}
+	if !peer.timers.retransmitHandshake.IsPending() {
+		t.Fatal("expected regular handshake initiation to arm retransmit timer without an endpoint")
 	}
 }
 

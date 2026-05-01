@@ -142,21 +142,48 @@ func (peer *Peer) SendPeerClosingNotice() {
 }
 
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+	result := peer.sendHandshakeInitiation(isRetry, false, false)
+	return result.Err
+}
+
+func (peer *Peer) forceHandshakeInitiation(bypassThrottle bool) HandshakeAttemptResult {
+	return peer.sendHandshakeInitiation(false, bypassThrottle, true)
+}
+
+func (peer *Peer) sendHandshakeInitiation(isRetry, bypassThrottle, forced bool) HandshakeAttemptResult {
+	if peer == nil || peer.device == nil || !peer.isRunning.Load() {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptPeerStopped}
+	}
+	if !peer.device.isUp() {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptDeviceDown}
+	}
+
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
 	}
 
-	peer.handshake.mutex.RLock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
-		peer.handshake.mutex.RUnlock()
-		return nil
+	if forced {
+		peer.endpoint.Lock()
+		hasEndpoint := peer.endpoint.val != nil
+		peer.endpoint.Unlock()
+		if !hasEndpoint {
+			return HandshakeAttemptResult{Outcome: HandshakeAttemptNoEndpoint, Err: ErrNoKnownEndpoint}
+		}
 	}
-	peer.handshake.mutex.RUnlock()
+
+	if !bypassThrottle {
+		peer.handshake.mutex.RLock()
+		if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+			peer.handshake.mutex.RUnlock()
+			return HandshakeAttemptResult{Outcome: HandshakeAttemptThrottled}
+		}
+		peer.handshake.mutex.RUnlock()
+	}
 
 	peer.handshake.mutex.Lock()
-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
+	if !bypassThrottle && time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
 		peer.handshake.mutex.Unlock()
-		return nil
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptThrottled}
 	}
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
@@ -166,7 +193,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
-		return err
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptWriteError, Err: err}
 	}
 
 	packet := make([]byte, MessageInitiationSize)
@@ -182,7 +209,13 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	}
 	peer.timersHandshakeInitiated()
 
-	return err
+	if errors.Is(err, ErrNoKnownEndpoint) {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptNoEndpoint, Err: err}
+	}
+	if err != nil {
+		return HandshakeAttemptResult{Outcome: HandshakeAttemptWriteError, Err: err}
+	}
+	return HandshakeAttemptResult{Outcome: HandshakeAttemptSent}
 }
 
 func (peer *Peer) SendHandshakeResponse() error {
