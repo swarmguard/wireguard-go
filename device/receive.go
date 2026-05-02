@@ -413,7 +413,7 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.endpoint)
 
-			device.log.Verbosef("%v - Received handshake initiation", peer)
+			device.log.Verbosef("%s - Received handshake initiation; %s", peerLogLabel(peer), peerCountersLogString(peer))
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			peer.SendHandshakeResponse()
@@ -440,7 +440,7 @@ func (device *Device) RoutineHandshake(id int) {
 			// update endpoint
 			peer.SetEndpointFromPacket(elem.endpoint)
 
-			device.log.Verbosef("%v - Received handshake response", peer)
+			device.log.Verbosef("%s - Received handshake response; %s", peerLogLabel(peer), peerCountersLogString(peer))
 			peer.rxBytes.Add(uint64(len(elem.packet)))
 
 			// update timers
@@ -484,14 +484,25 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		elemsContainer.Lock()
 		validTailPacket := -1
 		dataPacketReceived := false
+		decryptFailures := 0
+		replayRejects := 0
+		keepalives := 0
+		latencyProbes := 0
+		latencyAcks := 0
+		peerClosings := 0
+		dataPackets := 0
 		rxBytesLen := uint64(0)
 		for i, elem := range elemsContainer.elems {
 			if elem.packet == nil {
 				// decryption failed
+				decryptFailures++
+				logPeerDiagnosticEvery(peer, &peer.diagnostics.lastDecryptFailureAt, "%s - Rejected inbound transport packet: decrypt failed; %s", peerLogLabel(peer), peerCountersLogString(peer))
 				continue
 			}
 
 			if !elem.keypair.replayFilter.ValidateCounter(elem.counter, RejectAfterMessages) {
+				replayRejects++
+				logPeerDiagnosticEvery(peer, &peer.diagnostics.lastReplayRejectAt, "%s - Rejected inbound transport packet: replay counter=%d; %s", peerLogLabel(peer), elem.counter, peerCountersLogString(peer))
 				continue
 			}
 
@@ -503,7 +514,8 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
 
 			if elem.msgType == MessagePeerClosingType {
-				device.log.Verbosef("%v - Received peer-closing notice", peer)
+				peerClosings++
+				device.log.Verbosef("%s - Received peer-closing notice", peerLogLabel(peer))
 				peer.notePeerClosing()
 				continue
 			}
@@ -518,10 +530,12 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				peer.kickLinkWatchdog()
 				switch elem.msgType {
 				case MessageLatencyProbeType:
-					device.log.Verbosef("%v - Received latency probe", peer)
+					latencyProbes++
+					device.log.Verbosef("%s - Received latency probe", peerLogLabel(peer))
 					peer.handleLatencyProbe(token)
 				case MessageLatencyAckType:
-					device.log.Verbosef("%v - Received latency probe ack", peer)
+					latencyAcks++
+					device.log.Verbosef("%s - Received latency probe ack", peerLogLabel(peer))
 					peer.handleLatencyAck(token)
 				}
 				continue
@@ -529,11 +543,13 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 
 			validTailPacket = i
 			if len(elem.packet) == 0 {
-				device.log.Verbosef("%v - Receiving keepalive packet", peer)
+				keepalives++
+				device.log.Verbosef("%s - Receiving keepalive packet", peerLogLabel(peer))
 				peer.kickLinkWatchdog()
 				continue
 			}
 			dataPacketReceived = true
+			dataPackets++
 
 			switch elem.packet[0] >> 4 {
 			case 4:
@@ -548,7 +564,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				elem.packet = elem.packet[:length]
 				src := elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]
 				if device.allowedips.Lookup(src) != peer {
-					device.log.Verbosef("IPv4 packet with disallowed source address from %v", peer)
+					logPeerDiagnosticEvery(peer, &peer.diagnostics.lastDisallowedSourceAt, "%s - Rejected inbound IPv4 packet: disallowed source address; %s", peerLogLabel(peer), peerCountersLogString(peer))
 					continue
 				}
 
@@ -565,12 +581,12 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				elem.packet = elem.packet[:length]
 				src := elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]
 				if device.allowedips.Lookup(src) != peer {
-					device.log.Verbosef("IPv6 packet with disallowed source address from %v", peer)
+					logPeerDiagnosticEvery(peer, &peer.diagnostics.lastDisallowedSourceAt, "%s - Rejected inbound IPv6 packet: disallowed source address; %s", peerLogLabel(peer), peerCountersLogString(peer))
 					continue
 				}
 
 			default:
-				device.log.Verbosef("Packet with invalid IP version from %v", peer)
+				logPeerDiagnosticEvery(peer, &peer.diagnostics.lastInvalidIPVersionAt, "%s - Rejected inbound transport packet: invalid IP version; %s", peerLogLabel(peer), peerCountersLogString(peer))
 				continue
 			}
 
@@ -590,6 +606,21 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		}
 		if dataPacketReceived {
 			peer.timersDataReceived()
+		}
+		if decryptFailures > 0 || replayRejects > 0 || keepalives > 0 || latencyProbes > 0 || latencyAcks > 0 || peerClosings > 0 || dataPackets > 0 {
+			device.log.Verbosef(
+				"%s - Inbound WireGuard transport batch: data=%d keepalive=%d latencyProbe=%d latencyAck=%d peerClosing=%d decryptFailed=%d replayRejected=%d rxBytes=%d; %s",
+				peerLogLabel(peer),
+				dataPackets,
+				keepalives,
+				latencyProbes,
+				latencyAcks,
+				peerClosings,
+				decryptFailures,
+				replayRejects,
+				rxBytesLen,
+				peerCountersLogString(peer),
+			)
 		}
 		if len(bufs) > 0 {
 			_, err := device.tun.device.Write(bufs, MessageTransportOffsetContent)

@@ -98,20 +98,26 @@ func (peer *Peer) SendKeepalive() {
 
 func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error) {
 	if peer == nil || peer.device == nil || !peer.isRunning.Load() {
+		if peer != nil && peer.device != nil {
+			logPeerDiagnosticEvery(peer, &peer.diagnostics.lastControlPacketDropAt, "%s - Control packet %s not sent: peer not running; %s", peerLogLabel(peer), packetKindFromType(msgType), peerCountersLogString(peer))
+		}
 		return false, nil
 	}
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil {
+		logPeerDiagnosticEvery(peer, &peer.diagnostics.lastControlPacketDropAt, "%s - Control packet %s not sent: no current keypair; %s", peerLogLabel(peer), packetKindFromType(msgType), peerCountersLogString(peer))
 		return false, nil
 	}
 	if keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+		logPeerDiagnosticEvery(peer, &peer.diagnostics.lastControlPacketDropAt, "%s - Control packet %s not sent: keypair expired nonce=%d age=%s; %s", peerLogLabel(peer), packetKindFromType(msgType), keypair.sendNonce.Load(), time.Since(keypair.created).Round(time.Millisecond), peerCountersLogString(peer))
 		return false, nil
 	}
 
 	nonceValue := keypair.sendNonce.Add(1) - 1
 	if nonceValue >= RejectAfterMessages {
 		keypair.sendNonce.Store(RejectAfterMessages)
+		logPeerDiagnosticEvery(peer, &peer.diagnostics.lastControlPacketDropAt, "%s - Control packet %s not sent: nonce exhausted; %s", peerLogLabel(peer), packetKindFromType(msgType), peerCountersLogString(peer))
 		return false, nil
 	}
 
@@ -127,7 +133,11 @@ func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error
 
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
-	return true, peer.SendBuffers([][]byte{packet})
+	err := peer.SendBuffers([][]byte{packet})
+	if err != nil {
+		peer.device.log.Verbosef("%s - Control packet %s send failed: err=%v; %s", peerLogLabel(peer), packetKindFromType(msgType), err, peerCountersLogString(peer))
+	}
+	return true, err
 }
 
 func (peer *Peer) SendPeerClosingNotice() {
@@ -579,7 +589,19 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			}
 		}
 		if err != nil {
-			device.log.Verbosef("%v - Failed to send data packets: %v", peer, err)
+			data, keepalive, latencyProbe, latencyAck, peerClosing, other := packetKindCounts(bufs)
+			device.log.Verbosef(
+				"%s - Failed to send WireGuard packet batch: err=%v data=%d keepalive=%d latencyProbe=%d latencyAck=%d peerClosing=%d other=%d; %s",
+				peerLogLabel(peer),
+				err,
+				data,
+				keepalive,
+				latencyProbe,
+				latencyAck,
+				peerClosing,
+				other,
+				peerCountersLogString(peer),
+			)
 			continue
 		}
 

@@ -378,29 +378,44 @@ func (device *Device) LookupPeer(pk NoisePublicKey) *Peer {
 // not exist, or the peer is not currently running.
 func (device *Device) SendKeepaliveToPeer(pk NoisePublicKey) bool {
 	if !device.isUp() {
+		device.log.Verbosef("Immediate keepalive request skipped: device is not up")
 		return false
 	}
 
 	peer := device.LookupPeer(pk)
-	if peer == nil || !peer.isRunning.Load() {
+	if peer == nil {
+		device.log.Verbosef("Immediate keepalive request skipped: peer not found")
+		return false
+	}
+	if !peer.isRunning.Load() {
+		device.log.Verbosef("%s - Immediate keepalive request skipped: peer not running; %s", peerLogLabel(peer), peerCountersLogString(peer))
 		return false
 	}
 
+	device.log.Verbosef("%s - Immediate keepalive requested; %s", peerLogLabel(peer), peerCountersLogString(peer))
 	peer.SendKeepalive()
 	return true
 }
 
 func (device *Device) TriggerLatencyProbeToPeer(pk NoisePublicKey) bool {
 	if !device.isUp() {
+		device.log.Verbosef("Immediate latency probe request skipped: device is not up")
 		return false
 	}
 
 	peer := device.LookupPeer(pk)
-	if peer == nil || !peer.isRunning.Load() {
+	if peer == nil {
+		device.log.Verbosef("Immediate latency probe request skipped: peer not found")
+		return false
+	}
+	if !peer.isRunning.Load() {
+		device.log.Verbosef("%s - Immediate latency probe request skipped: peer not running; %s", peerLogLabel(peer), peerCountersLogString(peer))
 		return false
 	}
 
-	return peer.triggerLatencyProbe()
+	sent := peer.triggerLatencyProbe()
+	device.log.Verbosef("%s - Immediate latency probe requested: sent=%t; %s", peerLogLabel(peer), sent, peerCountersLogString(peer))
+	return sent
 }
 
 func (device *Device) PeerLatency(pk NoisePublicKey) (time.Duration, bool) {

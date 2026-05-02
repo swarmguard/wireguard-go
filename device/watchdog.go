@@ -59,11 +59,11 @@ func (device *Device) emitPeerEvent(event PeerEvent) {
 	if device == nil || device.peerEvents == nil {
 		return
 	}
-	device.log.Verbosef("%s - Link is %s", event.Peer, event.Type.String())
+	device.log.Verbosef("%s - Link is %s; %s", peerLogLabel(event.Peer), event.Type.String(), peerCountersLogString(event.Peer))
 	select {
 	case device.peerEvents <- event:
 	default:
-		device.log.Errorf("%s - Dropping peer event: channel full", event.Peer)
+		device.log.Errorf("%s - Dropping peer event: channel full", peerLogLabel(event.Peer))
 	}
 }
 
@@ -79,6 +79,7 @@ func expiredLinkWatchdog(peer *Peer) {
 	if !peer.timers.linkUp.Swap(false) {
 		return
 	}
+	peer.device.log.Verbosef("%s - Link watchdog expired: interval=%s; %s", peerLogLabel(peer), peer.linkWatchdogInterval(), peerCountersLogString(peer))
 	peer.timers.linkWatchdogProbe.Del()
 	peer.device.emitPeerEvent(PeerEvent{Type: PeerEventDown, Peer: peer, Key: peerPublicKey(peer)})
 }
@@ -90,7 +91,8 @@ func expiredLinkWatchdogProbe(peer *Peer) {
 	if !peer.timersActive() || peer.linkWatchdogInterval() == 0 || !peer.timers.linkUp.Load() {
 		return
 	}
-	peer.sendLinkWatchdogProbe()
+	sent := peer.sendLinkWatchdogProbe()
+	peer.device.log.Verbosef("%s - Link watchdog pre-expiry probe fired: sent=%t interval=%s; %s", peerLogLabel(peer), sent, peer.linkWatchdogInterval(), peerCountersLogString(peer))
 }
 
 // notePeerClosing marks the peer down immediately after receiving an
@@ -100,6 +102,7 @@ func (peer *Peer) notePeerClosing() {
 		return
 	}
 	if peer.timers.linkUp.Swap(false) {
+		peer.device.log.Verbosef("%s - Link marked down after peer-closing notice; %s", peerLogLabel(peer), peerCountersLogString(peer))
 		peer.timers.linkWatchdogProbe.Del()
 		peer.device.emitPeerEvent(PeerEvent{Type: PeerEventDown, Peer: peer, Key: peerPublicKey(peer)})
 	}
@@ -126,8 +129,10 @@ func (peer *Peer) kickLinkWatchdog() {
 	peer.timers.linkWatchdog.Mod(interval)
 	if probeInterval := linkWatchdogProbeInterval(interval); probeInterval > 0 {
 		peer.timers.linkWatchdogProbe.Mod(probeInterval)
+		peer.device.log.Verbosef("%s - Link watchdog kicked: interval=%s probeIn=%s; %s", peerLogLabel(peer), interval, probeInterval, peerCountersLogString(peer))
 	} else {
 		peer.timers.linkWatchdogProbe.Del()
+		peer.device.log.Verbosef("%s - Link watchdog kicked: interval=%s probe disabled; %s", peerLogLabel(peer), interval, peerCountersLogString(peer))
 	}
 }
 
@@ -166,8 +171,9 @@ func (peer *Peer) sendLinkWatchdogProbe() bool {
 	token := peer.device.latencyProbeSeq.Add(1)
 	sent, err := peer.sendControlPacket(MessageLatencyProbeType, encodeLatencyToken(token))
 	if err != nil {
-		peer.device.log.Verbosef("%v - Failed to send link watchdog probe: %v", peer, err)
+		peer.device.log.Verbosef("%s - Failed to send link watchdog probe: %v; %s", peerLogLabel(peer), err, peerCountersLogString(peer))
 	}
+	peer.device.log.Verbosef("%s - Link watchdog probe send result: sent=%t err=%v; %s", peerLogLabel(peer), sent, err, peerCountersLogString(peer))
 	return sent && err == nil
 }
 

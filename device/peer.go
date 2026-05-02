@@ -80,6 +80,15 @@ type Peer struct {
 		sync.RWMutex
 		value any
 	}
+
+	diagnostics struct {
+		sync.Mutex
+		lastDecryptFailureAt    time.Time
+		lastReplayRejectAt      time.Time
+		lastDisallowedSourceAt  time.Time
+		lastInvalidIPVersionAt  time.Time
+		lastControlPacketDropAt time.Time
+	}
 }
 
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
