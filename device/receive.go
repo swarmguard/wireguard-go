@@ -87,6 +87,22 @@ func (elem *QueueInboundElement) backingBuffer() []byte {
 	return nil
 }
 
+func (elem *QueueInboundElement) tunWriteBuffer(device *Device, scratch *[]*[MaxMessageSize]byte) []byte {
+	backingBuffer := elem.backingBuffer()
+	if backingBuffer == nil {
+		return nil
+	}
+	writeLen := MessageTransportOffsetContent + len(elem.packet)
+	if cap(backingBuffer) >= MessageTransportOffsetContent+MaxContentSize {
+		return backingBuffer[:writeLen]
+	}
+
+	buffer := device.GetMessageBuffer()
+	copy(buffer[MessageTransportOffsetContent:writeLen], elem.packet)
+	*scratch = append(*scratch, buffer)
+	return buffer[:writeLen]
+}
+
 /* Called when a new authenticated message has been received
  *
  * NOTE: Not thread safe, but called by sequential receiver!
@@ -476,6 +492,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	device.log.Verbosef("%v - Routine: sequential receiver - started", peer)
 
 	bufs := make([][]byte, 0, maxBatchSize)
+	tunWriteBuffers := make([]*[MaxMessageSize]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.inbound.c {
 		if elemsContainer == nil {
@@ -574,11 +591,11 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				continue
 			}
 
-			backingBuffer := elem.backingBuffer()
-			if backingBuffer == nil {
+			tunWriteBuffer := elem.tunWriteBuffer(device, &tunWriteBuffers)
+			if tunWriteBuffer == nil {
 				continue
 			}
-			bufs = append(bufs, backingBuffer[:MessageTransportOffsetContent+len(elem.packet)])
+			bufs = append(bufs, tunWriteBuffer)
 		}
 
 		peer.rxBytes.Add(rxBytesLen)
@@ -597,6 +614,10 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 				device.log.Errorf("Failed to write packets to TUN device: %v", err)
 			}
 		}
+		for _, buffer := range tunWriteBuffers {
+			device.PutMessageBuffer(buffer)
+		}
+		tunWriteBuffers = tunWriteBuffers[:0]
 		for _, elem := range elemsContainer.elems {
 			elem.releasePacket(device)
 			device.PutInboundElement(elem)
