@@ -18,7 +18,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/rwcancel"
 )
 
@@ -38,6 +37,7 @@ type NativeTun struct {
 	statusListenersShutdown chan struct{}
 	batchSize               int
 	vnetHdr                 bool
+	disableOffloads         bool
 	udpGSO                  bool
 
 	closeOnce sync.Once
@@ -334,6 +334,10 @@ func (tun *NativeTun) nameSlow() (string, error) {
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
+	if tun.disableOffloads {
+		defer tun.writeOpMu.Unlock()
+		return tun.writePlain(bufs, offset)
+	}
 	defer func() {
 		tun.tcpGROTable.reset()
 		tun.udpGROTable.reset()
@@ -451,6 +455,9 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	tun.readOpMu.Lock()
 	defer tun.readOpMu.Unlock()
+	if tun.disableOffloads {
+		return tun.readWithoutOffloads(bufs, sizes, offset)
+	}
 	select {
 	case err := <-tun.errors:
 		return 0, err
@@ -508,7 +515,7 @@ const (
 	tunUDPOffloads = unix.TUN_F_USO4 | unix.TUN_F_USO6
 )
 
-func (tun *NativeTun) initFromFlags(name string) error {
+func (tun *NativeTun) initFromFlags(name string, options Options) error {
 	sc, err := tun.tunFile.SyscallConn()
 	if err != nil {
 		return err
@@ -525,30 +532,17 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		if err != nil {
 			return
 		}
-		got := ifr.Uint16()
-		if got&unix.IFF_VNET_HDR != 0 {
-			// tunTCPOffloads were added in Linux v2.6. We require their support
-			// if IFF_VNET_HDR is set.
-			err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads)
-			if err != nil {
-				return
-			}
-			tun.vnetHdr = true
-			tun.batchSize = conn.IdealBatchSize
-			// tunUDPOffloads were added in Linux v6.2. We do not return an
-			// error if they are unsupported at runtime.
-			tun.udpGSO = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads|tunUDPOffloads) == nil
-		} else {
-			tun.batchSize = 1
-		}
+		err = tun.configureOffloads(ifr.Uint16(), options, func(flags int) error {
+			return unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, flags)
+		})
 	}); e != nil {
 		return e
 	}
 	return err
 }
 
-// CreateTUN creates a Device with the provided name and MTU.
-func CreateTUN(name string, mtu int) (Device, error) {
+// CreateTUNWithOptions creates a Device with the provided name, MTU and offload settings.
+func CreateTUNWithOptions(name string, mtu int, options Options) (Device, error) {
 	nfd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -578,19 +572,17 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
 
 	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	return CreateTUNFromFile(fd, mtu)
+	return CreateTUNFromFileWithOptions(fd, mtu, options)
 }
 
-// CreateTUNFromFile creates a Device from an os.File with the provided MTU.
-func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+// CreateTUNFromFileWithOptions creates a Device with the provided MTU and offload settings.
+// Descriptor ownership is the same as CreateTUNFromFile.
+func CreateTUNFromFileWithOptions(file *os.File, mtu int, options Options) (Device, error) {
 	tun := &NativeTun{
 		tunFile:                 file,
 		events:                  make(chan Event, 5),
 		errors:                  make(chan error, 5),
 		statusListenersShutdown: make(chan struct{}),
-		tcpGROTable:             newTCPGROTable(),
-		udpGROTable:             newUDPGROTable(),
-		toWrite:                 make([]int, 0, conn.IdealBatchSize),
 	}
 
 	name, err := tun.Name()
@@ -598,7 +590,7 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	err = tun.initFromFlags(name)
+	err = tun.initFromFlags(name, options)
 	if err != nil {
 		return nil, err
 	}
@@ -632,27 +624,24 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 	return tun, nil
 }
 
-// CreateUnmonitoredTUNFromFD creates a Device from the provided file
-// descriptor.
-func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+// CreateUnmonitoredTUNFromFDWithOptions creates an unmanaged Device with offload settings.
+// Descriptor ownership is the same as CreateUnmonitoredTUNFromFD.
+func CreateUnmonitoredTUNFromFDWithOptions(fd int, options Options) (Device, string, error) {
 	err := unix.SetNonblock(fd, true)
 	if err != nil {
 		return nil, "", err
 	}
 	file := os.NewFile(uintptr(fd), "/dev/tun")
 	tun := &NativeTun{
-		tunFile:     file,
-		events:      make(chan Event, 5),
-		errors:      make(chan error, 5),
-		tcpGROTable: newTCPGROTable(),
-		udpGROTable: newUDPGROTable(),
-		toWrite:     make([]int, 0, conn.IdealBatchSize),
+		tunFile: file,
+		events:  make(chan Event, 5),
+		errors:  make(chan error, 5),
 	}
 	name, err := tun.Name()
 	if err != nil {
 		return nil, "", err
 	}
-	err = tun.initFromFlags(name)
+	err = tun.initFromFlags(name, options)
 	if err != nil {
 		return nil, "", err
 	}
