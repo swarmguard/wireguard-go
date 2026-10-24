@@ -119,7 +119,7 @@ func socketTun(t testing.TB, disabled, framed bool) (*NativeTun, *os.File) {
 	if framed {
 		flags = unix.IFF_VNET_HDR
 	}
-	if err := dev.configureOffloads(flags, Options{DisableOffloads: disabled}, func(int) error { return nil }); err != nil {
+	if err := dev.configureOffloads(flags, Options{DisableSegmentationOffloads: disabled}, func(int) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	peer := os.NewFile(uintptr(fds[1]), "tun-peer")
@@ -139,14 +139,14 @@ func TestOffloadOptions(t *testing.T) {
 				if framed {
 					flags = unix.IFF_VNET_HDR
 				}
-				err := dev.configureOffloads(flags, Options{DisableOffloads: disabled}, func(v int) error {
+				err := dev.configureOffloads(flags, Options{DisableSegmentationOffloads: disabled}, func(v int) error {
 					calls = append(calls, v)
 					if len(calls)-1 == fail {
 						return unix.EPERM
 					}
 					return nil
 				})
-				if dev.disableOffloads != disabled || dev.vnetHdr != framed {
+				if dev.noSegmentation != disabled || dev.vnetHdr != framed {
 					t.Fatal("settings/framing changed")
 				}
 				if framed && fail == 0 {
@@ -165,8 +165,8 @@ func TestOffloadOptions(t *testing.T) {
 					if dev.BatchSize() != 1 || dev.udpGSO || dev.tcpGROTable != nil || dev.udpGROTable != nil || dev.toWrite != nil {
 						t.Fatal("compact setup allocated offload state")
 					}
-					if framed && (len(calls) != 1 || calls[0] != 0) {
-						t.Fatal("offloads not cleared")
+					if framed && (len(calls) != 1 || calls[0] != unix.TUN_F_CSUM) {
+						t.Fatal("checksum-only offload not selected")
 					}
 				} else {
 					if dev.tcpGROTable == nil || dev.udpGROTable == nil || cap(dev.toWrite) != 128 {
@@ -304,11 +304,11 @@ func TestCompactInvalidRead(t *testing.T) {
 					t.Fatal("invalid virtio accepted")
 				}
 			}
-			h := virtioNetHdr{flags: unix.VIRTIO_NET_HDR_F_NEEDS_CSUM}
+			h := virtioNetHdr{flags: unix.VIRTIO_NET_HDR_F_NEEDS_CSUM, csumStart: 65535, csumOffset: 65535}
 			_ = h.encode(packet)
 			_, _ = peer.Write(packet)
 			if _, err := dev.Read(bufs, sizes, 16); err == nil {
-				t.Fatal("partial checksum accepted")
+				t.Fatal("invalid checksum bounds accepted")
 			}
 			if _, err := dev.Write(bufs, 0); !errors.Is(err, io.ErrShortBuffer) {
 				t.Fatal(err)
@@ -351,6 +351,8 @@ func FuzzCompactRead(f *testing.F) {
 	for _, kind := range []string{"tcp4", "tcp6", "udp4", "udp6"} {
 		f.Add(batchAggregate(kind, 9))
 	}
+	partial, _ := partialChecksumPacket("udp6", 37)
+	f.Add(partial)
 	f.Add([]byte{})
 	plain := udp4Packet(ip4PortA, ip4PortB, 37)
 	clear(plain[:offset])

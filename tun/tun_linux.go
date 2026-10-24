@@ -37,7 +37,7 @@ type NativeTun struct {
 	statusListenersShutdown chan struct{}
 	batchSize               int
 	vnetHdr                 bool
-	disableOffloads         bool
+	noSegmentation          bool
 	udpGSO                  bool
 
 	closeOnce sync.Once
@@ -334,7 +334,7 @@ func (tun *NativeTun) nameSlow() (string, error) {
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
-	if tun.disableOffloads {
+	if tun.noSegmentation {
 		defer tun.writeOpMu.Unlock()
 		return tun.writePlain(bufs, offset)
 	}
@@ -455,8 +455,8 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	tun.readOpMu.Lock()
 	defer tun.readOpMu.Unlock()
-	if tun.disableOffloads {
-		return tun.readWithoutOffloads(bufs, sizes, offset)
+	if tun.noSegmentation {
+		return tun.readWithoutSegmentation(bufs, sizes, offset)
 	}
 	select {
 	case err := <-tun.errors:
@@ -531,6 +531,16 @@ func (tun *NativeTun) initFromFlags(name string, options Options) error {
 		err = unix.IoctlIfreq(int(fd), unix.TUNGETIFF, ifr)
 		if err != nil {
 			return
+		}
+		if options.DisableSegmentationOffloads && ifr.Uint16()&unix.IFF_VNET_HDR != 0 {
+			err = configureCompactFraming(func() (int, error) {
+				return unix.IoctlGetInt(int(fd), unix.TUNGETVNETHDRSZ)
+			}, func() error {
+				return unix.IoctlSetPointerInt(int(fd), unix.TUNSETVNETLE, 1)
+			})
+			if err != nil {
+				return
+			}
 		}
 		err = tun.configureOffloads(ifr.Uint16(), options, func(flags int) error {
 			return unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, flags)

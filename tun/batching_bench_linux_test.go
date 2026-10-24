@@ -28,7 +28,7 @@ func BenchmarkNativeOffloadSetup(b *testing.B) {
 	var dev NativeTun
 	setup := func() {
 		dev = NativeTun{}
-		if err := dev.configureOffloads(unix.IFF_VNET_HDR, Options{DisableOffloads: disabled}, func(int) error { return nil }); err != nil {
+		if err := dev.configureOffloads(unix.IFF_VNET_HDR, Options{DisableSegmentationOffloads: disabled}, func(int) error { return nil }); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -94,7 +94,7 @@ func TestNativeRetainedHeap(t *testing.T) {
 	runtime.ReadMemStats(&before)
 	for cycle := 0; cycle < 10; cycle++ {
 		nativeHeapFixture = &NativeTun{}
-		if err := nativeHeapFixture.configureOffloads(unix.IFF_VNET_HDR, Options{DisableOffloads: disabled}, func(int) error { return nil }); err != nil {
+		if err := nativeHeapFixture.configureOffloads(unix.IFF_VNET_HDR, Options{DisableSegmentationOffloads: disabled}, func(int) error { return nil }); err != nil {
 			t.Fatal(err)
 		}
 		runtime.GC()
