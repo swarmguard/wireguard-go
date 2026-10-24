@@ -6,12 +6,14 @@
 package device
 
 import (
+	"fmt"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/packetbudget"
 	"golang.zx2c4.com/wireguard/ratelimiter"
 	"golang.zx2c4.com/wireguard/rwcancel"
 	"golang.zx2c4.com/wireguard/tun"
@@ -66,6 +68,13 @@ type Device struct {
 	allowedips    AllowedIPs
 	indexTable    IndexTable
 	cookieChecker CookieChecker
+
+	// Resource accounting and admission for the packet pools and queues below.
+	// A nil packetBudget preserves the legacy allocation and queue behavior.
+	packetBudget  *packetbudget.Budget
+	admissionMu   sync.Mutex
+	readBuffers   []*[MaxMessageSize]byte
+	budgetWorkers sync.WaitGroup
 
 	pool struct {
 		inboundElementsContainer  *WaitPool
@@ -308,7 +317,26 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 }
 
 func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
+	device, err := NewDeviceWithOptions(tunDevice, bind, logger, DeviceOptions{})
+	if err != nil {
+		panic(err)
+	}
+	return device
+}
+
+// DeviceOptions supplies one runtime's shared storage and queue budget.
+// A nil PacketBudget preserves the legacy allocation and queue behavior.
+// Borrowed transport packets must already be charged to this same budget;
+// the device retains their original owner rather than charging a second copy.
+type DeviceOptions struct{ PacketBudget *packetbudget.Budget }
+
+// NewDeviceWithOptions reserves reader workspace before starting workers.
+// On failure the caller retains ownership of the TUN, bind, and budget.
+// Device.Close closes the shared budget; transport owners must subsequently
+// stop their readers and release any remaining workspace to that old budget.
+func NewDeviceWithOptions(tunDevice tun.Device, bind conn.Bind, logger *Logger, options DeviceOptions) (*Device, error) {
 	device := new(Device)
+	device.packetBudget = options.PacketBudget
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
@@ -328,11 +356,25 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 
 	device.PopulatePools()
 
+	// Reserve all required TUN workspace before starting any workers.
+	if device.packetBudget != nil {
+		for range device.BatchSize() {
+			buf := device.GetMessageBuffer()
+			if buf == nil {
+				for _, previous := range device.readBuffers {
+					device.PutMessageBuffer(previous)
+				}
+				return nil, fmt.Errorf("packet budget cannot reserve WireGuard TUN reader workspace")
+			}
+			device.readBuffers = append(device.readBuffers, buf)
+		}
+	}
+
 	// create queues
 
-	device.queue.handshake = newHandshakeQueue()
-	device.queue.encryption = newOutboundQueue()
-	device.queue.decryption = newInboundQueue()
+	device.queue.handshake = newHandshakeQueue(device.queueCapacity(QueueHandshakeSize))
+	device.queue.encryption = newOutboundQueue(device.queueCapacity(QueueOutboundSize))
+	device.queue.decryption = newInboundQueue(device.queueCapacity(QueueInboundSize))
 
 	// start workers
 
@@ -340,9 +382,10 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	device.state.stopping.Wait()
 	device.queue.encryption.wg.Add(cpus) // One for each RoutineHandshake
 	for i := 0; i < cpus; i++ {
-		go device.RoutineEncryption(i + 1)
-		go device.RoutineDecryption(i + 1)
-		go device.RoutineHandshake(i + 1)
+		device.budgetWorkers.Add(3)
+		go func() { defer device.budgetWorkers.Done(); device.RoutineEncryption(i + 1) }()
+		go func() { defer device.budgetWorkers.Done(); device.RoutineDecryption(i + 1) }()
+		go func() { defer device.budgetWorkers.Done(); device.RoutineHandshake(i + 1) }()
 	}
 
 	device.state.stopping.Add(1)      // RoutineReadFromTUN
@@ -350,7 +393,7 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	go device.RoutineReadFromTUN()
 	go device.RoutineTUNEventReader()
 
-	return device
+	return device, nil
 }
 
 // BatchSize returns the BatchSize for the device as a whole which is the max of
@@ -443,7 +486,12 @@ func (device *Device) Close() {
 	}
 
 	device.notifyPeersClosing()
+	device.admissionMu.Lock()
 	device.state.state.Store(uint32(deviceStateClosed))
+	if device.packetBudget != nil {
+		device.packetBudget.Close()
+	}
+	device.admissionMu.Unlock()
 	device.log.Verbosef("Device closing")
 
 	device.tun.device.Close()
@@ -460,6 +508,10 @@ func (device *Device) Close() {
 	device.queue.decryption.wg.Done()
 	device.queue.handshake.wg.Done()
 	device.state.stopping.Wait()
+	if device.packetBudget != nil {
+		device.budgetWorkers.Wait()
+		device.clearBudgetCaches()
+	}
 
 	device.rate.limiter.Close()
 

@@ -106,7 +106,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	peer.device = device
 	peer.queue.outbound = newAutodrainingOutboundQueue(device)
 	peer.queue.inbound = newAutodrainingInboundQueue(device)
-	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
+	peer.queue.staged = make(chan *QueueOutboundElementsContainer, device.queueCapacity(QueueStagedSize))
 
 	// map public key
 	_, ok := device.peers.keyMap[pk]
@@ -306,7 +306,10 @@ func (peer *Peer) Stop() {
 	peer.state.Lock()
 	defer peer.state.Unlock()
 
-	if !peer.isRunning.Swap(false) {
+	peer.device.admissionMu.Lock()
+	wasRunning := peer.isRunning.Swap(false)
+	peer.device.admissionMu.Unlock()
+	if !wasRunning {
 		return
 	}
 
@@ -317,6 +320,10 @@ func (peer *Peer) Stop() {
 	peer.queue.inbound.c <- nil
 	peer.queue.outbound.c <- nil
 	peer.stopping.Wait()
+	if peer.device.packetBudget != nil {
+		peer.device.flushInboundQueue(peer.queue.inbound)
+		peer.device.flushOutboundQueue(peer.queue.outbound)
+	}
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
 	peer.ZeroAndFlushAll()

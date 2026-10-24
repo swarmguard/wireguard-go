@@ -61,6 +61,10 @@ type QueueOutboundElementsContainer struct {
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
+	if elem.buffer == nil {
+		device.PutOutboundElement(elem)
+		return nil
+	}
 	elem.nonce = 0
 	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
@@ -80,17 +84,22 @@ func (elem *QueueOutboundElement) clearPointers() {
 /* Queues a keepalive if no packets are queued for peer
  */
 func (peer *Peer) SendKeepalive() {
-	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		elem := peer.device.NewOutboundElement()
+	if (len(peer.queue.staged) == 0 || peer.device.packetBudget != nil) && peer.isRunning.Load() {
+		elem := peer.device.newKeepaliveElement()
+		if elem == nil {
+			return
+		}
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
-		select {
-		case peer.queue.staged <- elemsContainer:
-			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
-		default:
-			peer.device.PutMessageBuffer(elem.buffer)
-			peer.device.PutOutboundElement(elem)
-			peer.device.PutOutboundElementsContainer(elemsContainer)
+		if peer.device.packetBudget != nil {
+			peer.StagePackets(elemsContainer)
+		} else {
+			select {
+			case peer.queue.staged <- elemsContainer:
+				peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
+			default:
+				peer.device.dropOutbound(elemsContainer)
+			}
 		}
 	}
 	peer.SendStagedPackets()
@@ -115,7 +124,11 @@ func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error
 		return false, nil
 	}
 
-	packet := make([]byte, MessageTransportHeaderSize+len(payload)+poly1305.TagSize)
+	packet := peer.device.controlBuffer(MessageTransportHeaderSize + len(payload) + poly1305.TagSize)
+	if packet == nil {
+		return false, errPacketBudget
+	}
+	defer peer.device.releaseControlBuffer(packet)
 	header := packet[:MessageTransportHeaderSize]
 	binary.LittleEndian.PutUint32(header[0:4], msgType)
 	binary.LittleEndian.PutUint32(header[4:8], keypair.remoteIndex)
@@ -169,7 +182,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	packet := make([]byte, MessageInitiationSize)
+	packet := peer.device.controlBuffer(MessageInitiationSize)
+	if packet == nil {
+		return errPacketBudget
+	}
+	defer peer.device.releaseControlBuffer(packet)
 	_ = msg.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
 
@@ -198,7 +215,11 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	packet := make([]byte, MessageResponseSize)
+	packet := peer.device.controlBuffer(MessageResponseSize)
+	if packet == nil {
+		return errPacketBudget
+	}
+	defer peer.device.releaseControlBuffer(packet)
 	_ = response.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
 
@@ -230,7 +251,11 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 		return err
 	}
 
-	packet := make([]byte, MessageCookieReplySize)
+	packet := device.controlBuffer(MessageCookieReplySize)
+	if packet == nil {
+		return errPacketBudget
+	}
+	defer device.releaseControlBuffer(packet)
 	_ = reply.marshal(packet)
 	// TODO: allocation could be avoided
 	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
@@ -270,10 +295,16 @@ func (device *Device) RoutineReadFromTUN() {
 	)
 
 	for i := range elems {
-		elems[i] = device.NewOutboundElement()
+		if device.packetBudget != nil {
+			elems[i] = device.GetOutboundElement()
+			elems[i].buffer = device.readBuffers[i]
+		} else {
+			elems[i] = device.NewOutboundElement()
+		}
 		bufs[i] = elems[i].buffer[:]
 	}
 
+	device.readBuffers = nil
 	defer func() {
 		for _, elem := range elems {
 			if elem != nil {
@@ -318,13 +349,17 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
+			replacement := device.NewOutboundElement()
+			if replacement == nil {
+				continue
+			} // Reuse workspace and discard data.
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
 				elemsByPeer[peer] = elemsForPeer
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
+			elems[i] = replacement
 			bufs[i] = elems[i].buffer[:]
 		}
 
@@ -362,6 +397,21 @@ func (device *Device) RoutineReadFromTUN() {
 }
 
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
+	if peer.device.packetBudget != nil {
+		peer.device.admissionMu.Lock()
+		admitted := peer.device.packetBudget.Admit(func() bool {
+			if peer.device.isClosed() || !peer.isRunning.Load() || !queueRoom(peer.queue.staged, outboundControl(elems)) {
+				return false
+			}
+			peer.queue.staged <- elems
+			return true
+		})
+		peer.device.admissionMu.Unlock()
+		if !admitted {
+			peer.device.dropOutbound(elems)
+		}
+		return
+	}
 	for {
 		select {
 		case peer.queue.staged <- elems:
@@ -427,10 +477,7 @@ top:
 			}
 
 			// add to parallel and sequential queue
-			if peer.isRunning.Load() {
-				peer.queue.outbound.c <- elemsContainer
-				peer.device.queue.encryption.c <- elemsContainer
-			} else {
+			if !peer.device.admitOutbound(peer, elemsContainer) {
 				for _, elem := range elemsContainer.elems {
 					peer.device.PutMessageBuffer(elem.buffer)
 					peer.device.PutOutboundElement(elem)

@@ -16,6 +16,7 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/conn/bindtest"
+	"golang.zx2c4.com/wireguard/packetbudget"
 	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -70,7 +71,7 @@ func newCapacityDevice(tb testing.TB, capacity, peers int) *Device {
 	channel := tuntest.NewChannelTUN()
 	tunnel := &capacityTUN{Device: channel.TUN(), capacity: nativeFixtureCapacity(capacity), ready: make(chan struct{})}
 	binds := bindtest.NewChannelBinds()
-	dev := NewDevice(tunnel, &capacityBind{Bind: binds[0], capacity: capacity}, NewLogger(LogLevelSilent, ""))
+	dev := newMeasuredDevice(tb, tunnel, &capacityBind{Bind: binds[0], capacity: capacity})
 	var private NoisePrivateKey
 	private[0], private[1] = 111, 17
 	if err := dev.IpcSet("private_key=" + hex.EncodeToString(private[:]) + "\n"); err != nil {
@@ -135,7 +136,17 @@ func TestBatchRetainedHeap(t *testing.T) {
 			runtime.GC()
 			runtime.ReadMemStats(&live)
 			runtime.KeepAlive(dev)
+			if dev.packetBudget != nil {
+				t.Logf("managed stats live: %+v", dev.packetBudget.Snapshot())
+			}
 			dev.Close()
+			if dev.packetBudget != nil {
+				stats := dev.packetBudget.Snapshot()
+				t.Logf("managed stats after close: %+v", stats)
+				if stats.Outstanding != 0 || stats.ManagedBytes != 0 {
+					t.Fatal(stats)
+				}
+			}
 			runtime.GC()
 			runtime.GC()
 			runtime.ReadMemStats(&after)
@@ -154,7 +165,7 @@ func capacityPair(tb testing.TB, capacity int) (pair testPair) {
 		p.tun = tuntest.NewChannelTUN()
 		p.ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
 		tunnel := &capacityTUN{Device: p.tun.TUN(), capacity: nativeFixtureCapacity(capacity), ready: make(chan struct{})}
-		p.dev = NewDevice(tunnel, &capacityBind{Bind: binds[i], capacity: capacity}, NewLogger(LogLevelSilent, ""))
+		p.dev = newMeasuredDevice(tb, tunnel, &capacityBind{Bind: binds[i], capacity: capacity})
 		if err := p.dev.IpcSet(configs[i]); err != nil {
 			tb.Fatal(err)
 		}
@@ -284,5 +295,137 @@ func closeCapacityPair(pair testPair) {
 			}
 		}
 	drained:
+	}
+}
+
+// newMeasuredDevice switches only allocator policy for matched benchmarks.
+func newMeasuredDevice(tb testing.TB, tunnel tun.Device, bind conn.Bind) *Device {
+	tb.Helper()
+	var budget *packetbudget.Budget
+	if os.Getenv("SG_BENCH_BUDGET") == "1" {
+		var err error
+		budget, err = packetbudget.New(packetbudget.Config{MaxBytes: 8 << 20, ControlReserveBytes: 256 << 10, MaxCachedBytes: 1 << 20, QueueEntries: 64})
+		if err != nil {
+			tb.Fatal(err)
+		}
+	}
+	device, err := NewDeviceWithOptions(tunnel, bind, NewLogger(LogLevelSilent, ""), DeviceOptions{PacketBudget: budget})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return device
+}
+
+// BenchmarkPacketBudgetPeerTransfer measures one active encrypted path with
+// either one or sixteen registered peers per device. Other peers remain idle.
+func BenchmarkPacketBudgetPeerTransfer(b *testing.B) {
+	for _, peers := range []int{1, 16} {
+		b.Run(fmt.Sprintf("peers%d", peers), func(b *testing.B) {
+			pair := capacityPair(b, fixtureCapacity(b))
+			for _, p := range pair {
+				for i := 1; i < peers; i++ {
+					var key NoisePrivateKey
+					key[0], key[1] = byte(i+50), byte(i+99)
+					if _, err := p.dev.NewPeer(key.publicKey()); err != nil {
+						b.Fatal(err)
+					}
+				}
+			}
+			pair.Send(b, Ping, nil)
+			pair.Send(b, Pong, nil)
+			packet := tuntest.Ping(pair[0].ip, pair[1].ip)
+			packet = append(packet, make([]byte, 1280-len(packet))...)
+			packet[2], packet[3] = 5, 0
+			ip := header.IPv4(packet)
+			ip.SetChecksum(0)
+			ip.SetChecksum(^ip.CalculateChecksum())
+			b.SetBytes(1280)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				pair[1].tun.Outbound <- packet
+				received := <-pair[0].tun.Inbound
+				if !bytes.Equal(received, packet) {
+					b.Fatal("packet corrupted")
+				}
+			}
+		})
+	}
+}
+
+// TestPacketBudgetHeap records idle, traffic and closed heap with live fixtures.
+func TestPacketBudgetHeap(t *testing.T) {
+	if os.Getenv("SG_BATCH_MEASURE") != "1" {
+		t.Skip("opt-in heap measurement")
+	}
+	capacity := fixtureCapacity(t)
+	for _, peers := range []int{0, 1, 16} {
+		for cycle := 0; cycle < 10; cycle++ {
+			var before, idle, traffic, closed runtime.MemStats
+			runtime.GC()
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			t.Run(fmt.Sprintf("peers%d/cycle%d", peers, cycle), func(t *testing.T) {
+				var pair testPair
+				if peers == 0 {
+					pair[0].dev = newCapacityDevice(t, capacity, 0)
+				} else {
+					pair = capacityPair(t, capacity)
+					for _, p := range pair {
+						for i := 1; i < peers; i++ {
+							var key NoisePrivateKey
+							key[0], key[1] = byte(i+50), byte(i+99)
+							if _, err := p.dev.NewPeer(key.publicKey()); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					pair.Send(t, Ping, nil)
+					pair.Send(t, Pong, nil)
+				}
+				runtime.GC()
+				runtime.GC()
+				runtime.ReadMemStats(&idle)
+				if peers > 0 {
+					for range 1000 {
+						pair.Send(t, Ping, nil)
+					}
+				}
+				runtime.GC()
+				runtime.GC()
+				runtime.ReadMemStats(&traffic)
+				for _, p := range pair {
+					if p.dev != nil {
+						logManagedStats(t, "traffic", p.dev)
+					}
+				}
+				closeCapacityPair(pair)
+				for _, p := range pair {
+					if p.dev != nil {
+						logManagedStats(t, "closed", p.dev)
+					}
+				}
+				runtime.KeepAlive(pair)
+			})
+			runtime.GC()
+			runtime.GC()
+			runtime.ReadMemStats(&closed)
+			t.Logf("heap peers=%d cycle=%d before=%d idle=%d traffic=%d closed=%d goroutines=%d", peers, cycle, before.HeapAlloc, idle.HeapAlloc, traffic.HeapAlloc, closed.HeapAlloc, runtime.NumGoroutine())
+		}
+	}
+}
+
+// logManagedStats verifies that completed fixtures retain no payload ownership.
+func logManagedStats(t *testing.T, phase string, dev *Device) {
+	if dev.packetBudget == nil {
+		return
+	}
+	s := dev.packetBudget.Snapshot()
+	t.Logf("managed phase=%s %+v", phase, s)
+	if phase == "closed" && (s.ManagedBytes != 0 || s.CachedBytes != 0 || s.Outstanding != 0) {
+		t.Fatal(s)
+	}
+	if s.PeakBytes > dev.packetBudget.Config().MaxBytes || s.DataBytes > dev.packetBudget.Config().MaxBytes-dev.packetBudget.Config().ControlReserveBytes {
+		t.Fatal(s)
 	}
 }
