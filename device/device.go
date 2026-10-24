@@ -104,6 +104,12 @@ type Device struct {
 	log      *Logger
 }
 
+// DeviceOptions supplies one runtime's shared storage and queue budget.
+// A nil PacketBudget preserves the legacy allocation and queue behavior.
+// Borrowed transport packets must already be charged to this same budget;
+// the device retains their original owner rather than charging a second copy.
+type DeviceOptions struct{ PacketBudget *packetbudget.Budget }
+
 // deviceState represents the state of a Device.
 // There are three states: down, up, closed.
 // Transitions:
@@ -323,12 +329,6 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 	}
 	return device
 }
-
-// DeviceOptions supplies one runtime's shared storage and queue budget.
-// A nil PacketBudget preserves the legacy allocation and queue behavior.
-// Borrowed transport packets must already be charged to this same budget;
-// the device retains their original owner rather than charging a second copy.
-type DeviceOptions struct{ PacketBudget *packetbudget.Budget }
 
 // NewDeviceWithOptions reserves reader workspace before starting workers.
 // On failure the caller retains ownership of the TUN, bind, and budget.

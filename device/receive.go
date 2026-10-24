@@ -38,9 +38,9 @@ type QueueInboundElement struct {
 }
 
 type QueueInboundElementsContainer struct {
-	control bool
 	sync.Mutex
-	elems []*QueueInboundElement
+	elems   []*QueueInboundElement
+	control bool
 }
 
 // clearPointers clears elem fields that contain pointers.

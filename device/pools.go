@@ -10,14 +10,15 @@ import (
 )
 
 type WaitPool struct {
-	pool       sync.Pool
-	cond       sync.Cond
-	lock       sync.Mutex
-	count      uint32 // Get calls not yet Put back
+	pool  sync.Pool
+	cond  sync.Cond
+	lock  sync.Mutex
+	count uint32 // Get calls not yet Put back
+	max   uint32
+
 	cacheLimit int
 	free       []any
 	newObject  func() any
-	max        uint32
 }
 
 func NewWaitPool(max uint32, new func() any) *WaitPool {
