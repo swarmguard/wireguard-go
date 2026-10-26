@@ -265,3 +265,56 @@ func TestBudgetStagingAndWriteScratch(t *testing.T) {
 		t.Fatal(s)
 	}
 }
+
+// TestBudgetKeepaliveWithoutSession checks that keepalives for a peer without
+// a session do not accumulate budgeted buffers. Persistent keepalives and peer
+// reconfiguration call SendKeepalive repeatedly while a peer is offline; each
+// staged keepalive would hold a full message buffer until a session exists,
+// so a few offline peers could otherwise exhaust the shared budget and stop
+// all data traffic. The keepalive must still start a handshake.
+func TestBudgetKeepaliveWithoutSession(t *testing.T) {
+	budget := newTestBudget(t)
+	cfg, _ := genConfigs(t)
+	binds := bindtest.NewChannelBinds()
+	dev, err := NewDeviceWithOptions(tuntest.NewChannelTUN().TUN(), binds[0], NewLogger(LogLevelSilent, ""), DeviceOptions{PacketBudget: budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dev.Close()
+	if err := dev.IpcSet(cfg[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := dev.Up(); err != nil {
+		t.Fatal(err)
+	}
+	var peer *Peer
+	for _, p := range dev.peers.keyMap {
+		peer = p
+	}
+	if peer.keypairs.Current() != nil {
+		t.Fatal("peer unexpectedly has a session")
+	}
+	baseline := budget.Snapshot()
+	// Peer.Start initializes this timestamp even before sending a handshake.
+	peer.handshake.mutex.RLock()
+	before := peer.handshake.lastSentHandshake
+	peer.handshake.mutex.RUnlock()
+
+	for range 4 * cap(peer.queue.staged) {
+		peer.SendKeepalive()
+	}
+	if n := len(peer.queue.staged); n != 0 {
+		t.Fatalf("staged keepalives without session = %d, want 0", n)
+	}
+	// Cached bytes are bounded by MaxCachedBytes and include the handshake
+	// message buffer, so compare only checked-out and queued storage.
+	if s := budget.Snapshot(); s.Outstanding != baseline.Outstanding || s.ManagedBytes-s.CachedBytes > baseline.ManagedBytes-baseline.CachedBytes {
+		t.Fatalf("budget grew from %+v to %+v", baseline, s)
+	}
+	peer.handshake.mutex.RLock()
+	sent := peer.handshake.lastSentHandshake
+	peer.handshake.mutex.RUnlock()
+	if !sent.After(before) {
+		t.Fatal("keepalive did not start a handshake")
+	}
+}

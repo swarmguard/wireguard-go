@@ -84,6 +84,17 @@ func (elem *QueueOutboundElement) clearPointers() {
 /* Queues a keepalive if no packets are queued for peer
  */
 func (peer *Peer) SendKeepalive() {
+	// With a packet budget, a keepalive that cannot be sent yet would hold a
+	// full message buffer in the staged queue until a session exists. Repeated
+	// keepalives for offline peers could then exhaust the shared budget and
+	// stop all data traffic. Start the handshake instead, as staging would;
+	// the handshake response handler sends a fresh keepalive.
+	if peer.device.packetBudget != nil && !peer.hasSendableKeypair() {
+		if peer.isRunning.Load() && peer.device.isUp() {
+			peer.SendHandshakeInitiation(false)
+		}
+		return
+	}
 	if (len(peer.queue.staged) == 0 || peer.device.packetBudget != nil) && peer.isRunning.Load() {
 		elem := peer.device.newKeepaliveElement()
 		if elem == nil {
@@ -103,6 +114,13 @@ func (peer *Peer) SendKeepalive() {
 		}
 	}
 	peer.SendStagedPackets()
+}
+
+// hasSendableKeypair reports whether staged packets can be encrypted now,
+// using the same conditions as SendStagedPackets.
+func (peer *Peer) hasSendableKeypair() bool {
+	keypair := peer.keypairs.Current()
+	return keypair != nil && keypair.sendNonce.Load() < RejectAfterMessages && time.Since(keypair.created) < RejectAfterTime
 }
 
 func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error) {

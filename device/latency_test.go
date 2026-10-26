@@ -7,6 +7,7 @@ package device
 
 import (
 	"crypto/cipher"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,6 +60,7 @@ func waitForBindCount(tb testing.TB, bind *recordingBind, msgType uint32, want i
 }
 
 type recordingBind struct {
+	mu        sync.Mutex
 	sendTypes []uint32
 }
 
@@ -70,6 +72,8 @@ func (b *recordingBind) SetMark(mark uint32) error                     { return 
 func (b *recordingBind) ParseEndpoint(s string) (conn.Endpoint, error) { return nil, nil }
 func (b *recordingBind) BatchSize() int                                { return 1 }
 func (b *recordingBind) Send(bufs [][]byte, ep conn.Endpoint) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for _, buf := range bufs {
 		if len(buf) >= 4 {
 			b.sendTypes = append(b.sendTypes, uint32(buf[0])|uint32(buf[1])<<8|uint32(buf[2])<<16|uint32(buf[3])<<24)
@@ -79,6 +83,8 @@ func (b *recordingBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 }
 
 func (b *recordingBind) count(msgType uint32) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	total := 0
 	for _, typ := range b.sendTypes {
 		if typ == msgType {
