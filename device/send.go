@@ -8,6 +8,7 @@ package device
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -46,11 +47,11 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  []byte   // slice holding the packet data
+	packet  []byte   // slice of "buffer" (always!)
+	nonce   uint64   // nonce for encryption
+	keypair *Keypair // keypair for encryption
+	peer    *Peer    // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -319,7 +320,7 @@ func (device *Device) RoutineReadFromTUN() {
 		} else {
 			elems[i] = device.NewOutboundElement()
 		}
-		bufs[i] = elems[i].buffer[:]
+		bufs[i] = device.tunReadBuffer(elems[i].buffer)
 	}
 
 	device.readBuffers = nil
@@ -337,6 +338,10 @@ func (device *Device) RoutineReadFromTUN() {
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
+				continue
+			}
+			if device.packetBufferSize() < MaxMessageSize &&
+				(sizes[i] > len(bufs[i])-offset || sizes[i] > int(device.tun.mtu.Load())) {
 				continue
 			}
 
@@ -378,7 +383,7 @@ func (device *Device) RoutineReadFromTUN() {
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
 			elems[i] = replacement
-			bufs[i] = elems[i].buffer[:]
+			bufs[i] = device.tunReadBuffer(elems[i].buffer)
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
@@ -396,6 +401,11 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		if readErr != nil {
+			if device.packetBufferSize() < MaxMessageSize && errors.Is(readErr, io.ErrShortBuffer) {
+				// This capability guarantees the oversized packet was consumed;
+				// keep the tunnel alive for subsequent valid packets.
+				continue
+			}
 			if errors.Is(readErr, tun.ErrTooManySegments) {
 				// TODO: record stat for this
 				// This will happen if MSS is surprisingly small (< 576)
@@ -569,6 +579,12 @@ func (device *Device) RoutineEncryption(id int) {
 
 			// pad content to multiple of 16
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
+			if device.packetBufferSize() < MaxMessageSize && len(elem.packet)+paddingSize+MessageTransportSize > len(elem.buffer) {
+				// An MTU change may race a queued packet. Never let append or Seal
+				// silently escape the configured storage budget.
+				elem.packet = nil
+				continue
+			}
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
 			// encrypt content and release to consumer
@@ -618,6 +634,9 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		dataSent := false
 		elemsContainer.Lock()
 		for _, elem := range elemsContainer.elems {
+			if elem.packet == nil {
+				continue
+			}
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
 			}

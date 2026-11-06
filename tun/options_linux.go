@@ -38,6 +38,14 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 	return CreateUnmonitoredTUNFromFDWithOptions(fd, Options{})
 }
 
+// PacketBufferCapabilities advertises the non-aggregating packet-atomic path.
+func (tun *NativeTun) PacketBufferCapabilities() PacketBufferCapabilities {
+	return PacketBufferCapabilities{
+		ReadConsumesWholePacket: tun.noSegmentation,
+		WriteUsesPacketLength:   tun.noSegmentation,
+	}
+}
+
 // configureOffloads preserves normal negotiation and allocations. Compact mode
 // retains checksum offload and disables segmentation offloads. The callback
 // permits testing ioctl failures without a kernel TUN.

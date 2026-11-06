@@ -23,12 +23,12 @@ type QueueHandshakeElement struct {
 	msgType        uint32
 	packet         []byte
 	endpoint       conn.Endpoint
-	buffer         *[MaxMessageSize]byte
+	buffer         []byte
 	borrowedPacket conn.BorrowedPacket
 }
 
 type QueueInboundElement struct {
-	buffer         *[MaxMessageSize]byte
+	buffer         []byte
 	packet         []byte
 	counter        uint64
 	keypair        *Keypair
@@ -89,18 +89,25 @@ func (elem *QueueInboundElement) backingBuffer() []byte {
 	return nil
 }
 
-func (elem *QueueInboundElement) tunWriteBuffer(device *Device, scratch *[]*[MaxMessageSize]byte) []byte {
+func (elem *QueueInboundElement) tunWriteBuffer(device *Device, scratch *[][]byte) []byte {
 	backingBuffer := elem.backingBuffer()
 	if backingBuffer == nil {
 		return nil
 	}
 	writeLen := MessageTransportOffsetContent + len(elem.packet)
+	if device.packetBuffers.WriteUsesPacketLength && len(backingBuffer) >= writeLen {
+		return backingBuffer[:writeLen]
+	}
 	if cap(backingBuffer) >= MessageTransportOffsetContent+MaxContentSize {
 		return backingBuffer[:writeLen]
 	}
 
 	buffer := device.GetMessageBuffer()
 	if buffer == nil {
+		return nil
+	}
+	if writeLen > len(buffer) {
+		device.PutMessageBuffer(buffer)
 		return nil
 	}
 	copy(buffer[MessageTransportOffsetContent:writeLen], elem.packet)
@@ -168,7 +175,7 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 				continue
 			}
 			packet := borrowedPacket.Bytes()
-			if len(packet) < MinMessageSize {
+			if len(packet) < MinMessageSize || len(packet) > device.packetBufferSize() {
 				borrowedPacket.Release()
 				packets[i] = nil
 				continue
@@ -502,7 +509,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	device.log.Verbosef("%v - Routine: sequential receiver - started", peer)
 
 	bufs := make([][]byte, 0, maxBatchSize)
-	tunWriteBuffers := make([]*[MaxMessageSize]byte, 0, maxBatchSize)
+	tunWriteBuffers := make([][]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.inbound.c {
 		if elemsContainer == nil {

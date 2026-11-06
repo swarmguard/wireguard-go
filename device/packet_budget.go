@@ -97,17 +97,22 @@ func (device *Device) newKeepaliveElement() *QueueOutboundElement {
 	if device.packetBudget == nil {
 		return device.NewOutboundElement()
 	}
-	buffer := device.packetBudget.Get(MaxMessageSize, true)
+	buffer := device.packetBudget.Get(device.packetBufferSize(), true)
 	if buffer == nil {
 		return nil
 	}
 	elem := device.GetOutboundElement()
-	elem.buffer = (*[MaxMessageSize]byte)(buffer)
+	elem.buffer = buffer
 	elem.nonce = 0
 	return elem
 }
 
 func (device *Device) controlBuffer(size int) []byte {
+	// Control packets share the device's fixed capacity limit, including the
+	// transport header and authentication tag. Reject before any allocation.
+	if size <= 0 || size > device.packetBufferSize() {
+		return nil
+	}
 	if device.packetBudget == nil {
 		return make([]byte, size)
 	}

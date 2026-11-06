@@ -71,10 +71,12 @@ type Device struct {
 
 	// Resource accounting and admission for the packet pools and queues below.
 	// A nil packetBudget preserves the legacy allocation and queue behavior.
-	packetBudget  *packetbudget.Budget
-	admissionMu   sync.Mutex
-	readBuffers   []*[MaxMessageSize]byte
-	budgetWorkers sync.WaitGroup
+	packetBudget      *packetbudget.Budget
+	admissionMu       sync.Mutex
+	readBuffers       [][]byte
+	packetBuffers     tun.PacketBufferCapabilities
+	messageBufferSize int
+	budgetWorkers     sync.WaitGroup
 
 	pool struct {
 		inboundElementsContainer  *WaitPool
@@ -108,7 +110,13 @@ type Device struct {
 // A nil PacketBudget preserves the legacy allocation and queue behavior.
 // Borrowed transport packets must already be charged to this same budget;
 // the device retains their original owner rather than charging a second copy.
-type DeviceOptions struct{ PacketBudget *packetbudget.Budget }
+type DeviceOptions struct {
+	PacketBudget *packetbudget.Budget
+	// MessageBufferSize bounds owned per-packet storage. Zero preserves the
+	// legacy maximum. Smaller storage requires a shared budget and a TUN that
+	// explicitly supports packet-sized reads and writes, with a fitting MTU.
+	MessageBufferSize int
+}
 
 // deviceState represents the state of a Device.
 // There are three states: down, up, closed.
@@ -337,12 +345,22 @@ func NewDevice(tunDevice tun.Device, bind conn.Bind, logger *Logger) *Device {
 func NewDeviceWithOptions(tunDevice tun.Device, bind conn.Bind, logger *Logger, options DeviceOptions) (*Device, error) {
 	device := new(Device)
 	device.packetBudget = options.PacketBudget
+	device.packetBuffers = tun.PacketBuffers(tunDevice)
+	device.messageBufferSize = options.MessageBufferSize
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger
 	device.net.bind = bind
 	device.tun.device = tunDevice
 	mtu, err := device.tun.device.MTU()
+	if device.packetBufferSize() != MaxMessageSize {
+		if err != nil {
+			return nil, fmt.Errorf("small packet buffers require a known MTU: %w", err)
+		}
+		if err := device.validatePacketBufferSize(mtu); err != nil {
+			return nil, err
+		}
+	}
 	if err != nil {
 		device.log.Errorf("Trouble determining MTU, assuming default: %v", err)
 		mtu = DefaultMTU

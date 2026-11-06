@@ -119,18 +119,18 @@ func (device *Device) PutOutboundElementsContainer(c *QueueOutboundElementsConta
 	device.pool.outboundElementsContainer.Put(c)
 }
 
-func (device *Device) GetMessageBuffer() *[MaxMessageSize]byte {
+func (device *Device) GetMessageBuffer() []byte {
 	if device.packetBudget != nil {
-		buf := device.packetBudget.Get(MaxMessageSize, false)
+		buf := device.packetBudget.Get(device.packetBufferSize(), false)
 		if buf == nil {
 			return nil
 		}
-		return (*[MaxMessageSize]byte)(buf)
+		return buf
 	}
-	return device.pool.messageBuffers.Get().(*[MaxMessageSize]byte)
+	return device.pool.messageBuffers.Get().(*[MaxMessageSize]byte)[:]
 }
 
-func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
+func (device *Device) PutMessageBuffer(msg []byte) {
 	if msg == nil {
 		return
 	}
@@ -138,7 +138,7 @@ func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
 		device.packetBudget.Put(msg[:])
 		return
 	}
-	device.pool.messageBuffers.Put(msg)
+	device.pool.messageBuffers.Put((*[MaxMessageSize]byte)(msg))
 }
 
 func (device *Device) GetInboundElement() *QueueInboundElement {

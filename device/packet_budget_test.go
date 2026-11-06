@@ -10,6 +10,7 @@ import (
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/conn/bindtest"
 	"golang.zx2c4.com/wireguard/packetbudget"
+	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/tuntest"
 )
 
@@ -73,7 +74,7 @@ func TestBudgetPairedAdmission(t *testing.T) {
 // TestBudgetDeviceTransferAndClose checks live encrypted traffic and complete
 // ownership release over repeated activations with independent budgets.
 func TestBudgetDeviceTransferAndClose(t *testing.T) {
-	for range 3 {
+	for _, size := range []int{0, 2048, 2048} {
 		cfg, endpointCfg := genConfigs(t)
 		binds := bindtest.NewChannelBinds()
 		var pair testPair
@@ -82,7 +83,11 @@ func TestBudgetDeviceTransferAndClose(t *testing.T) {
 			budgets[i] = newTestBudget(t)
 			pair[i].tun = tuntest.NewChannelTUN()
 			pair[i].ip = netip.AddrFrom4([4]byte{1, 0, 0, byte(i + 1)})
-			dev, err := NewDeviceWithOptions(pair[i].tun.TUN(), binds[i], NewLogger(LogLevelError, ""), DeviceOptions{PacketBudget: budgets[i]})
+			var tdev tun.Device = pair[i].tun.TUN()
+			if size != 0 {
+				tdev = newSmallTestTUN(pair[i].tun, 1420)
+			}
+			dev, err := NewDeviceWithOptions(tdev, binds[i], NewLogger(LogLevelError, ""), DeviceOptions{PacketBudget: budgets[i], MessageBufferSize: size})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -228,7 +233,7 @@ func TestBudgetStagingAndWriteScratch(t *testing.T) {
 	peer.FlushStagedPackets()
 	source := &budgetBorrowed{budget: budget, buf: budget.Get(2048, false)}
 	elem := &QueueInboundElement{borrowedPacket: source, packet: source.buf[16:36]}
-	var scratch []*[MaxMessageSize]byte
+	var scratch [][]byte
 	if elem.tunWriteBuffer(dev, &scratch) == nil || len(scratch) != 1 {
 		t.Fatal("missing admitted copy")
 	}
@@ -241,7 +246,7 @@ func TestBudgetStagingAndWriteScratch(t *testing.T) {
 		t.Fatal("cannot fill data budget")
 	}
 	// A cached message buffer is already charged, so fill it too if reused.
-	var held []*[MaxMessageSize]byte
+	var held [][]byte
 	for {
 		buf := dev.GetMessageBuffer()
 		if buf == nil {
