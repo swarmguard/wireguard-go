@@ -39,6 +39,7 @@ type NativeTun struct {
 	vnetHdr                 bool
 	noSegmentation          bool
 	udpGSO                  bool
+	receiveGrouping         *receiveGrouping
 
 	closeOnce sync.Once
 
@@ -49,7 +50,7 @@ type NativeTun struct {
 	readOpMu sync.Mutex                    // readOpMu guards readBuff
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
-	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable
+	writeOpMu   sync.Mutex // writeOpMu guards grouping workspace and GRO tables
 	toWrite     []int
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
@@ -336,6 +337,9 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
 	if tun.noSegmentation {
 		defer tun.writeOpMu.Unlock()
+		if tun.receiveGrouping != nil {
+			return tun.writeGrouped(bufs, offset)
+		}
 		return tun.writePlain(bufs, offset)
 	}
 	defer func() {
@@ -498,6 +502,9 @@ func (tun *NativeTun) Close() error {
 			close(tun.events)
 		}
 		err2 = tun.tunFile.Close()
+		tun.writeOpMu.Lock()
+		tun.closeReceiveGrouping()
+		tun.writeOpMu.Unlock()
 	})
 	if err1 != nil {
 		return err1
@@ -563,6 +570,7 @@ func CreateTUNWithOptions(name string, mtu int, options Options) (Device, error)
 
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
+		unix.Close(nfd)
 		return nil, err
 	}
 	// IFF_VNET_HDR enables the "tun status hack" via routineHackListener()
@@ -570,6 +578,7 @@ func CreateTUNWithOptions(name string, mtu int, options Options) (Device, error)
 	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
+		unix.Close(nfd)
 		return nil, err
 	}
 
@@ -582,7 +591,11 @@ func CreateTUNWithOptions(name string, mtu int, options Options) (Device, error)
 	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
 
 	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	return CreateTUNFromFileWithOptions(fd, mtu, options)
+	dev, err := CreateTUNFromFileWithOptions(fd, mtu, options)
+	if err != nil {
+		fd.Close()
+	}
+	return dev, err
 }
 
 // CreateTUNFromFileWithOptions creates a Device with the provided MTU and offload settings.
@@ -602,8 +615,15 @@ func CreateTUNFromFileWithOptions(file *os.File, mtu int, options Options) (Devi
 
 	err = tun.initFromFlags(name, options)
 	if err != nil {
+		tun.closeReceiveGrouping()
 		return nil, err
 	}
+	groupingReady := false
+	defer func() {
+		if !groupingReady {
+			tun.closeReceiveGrouping()
+		}
+	}()
 
 	// start event listener
 	tun.index, err = getIFIndex(name)
@@ -621,16 +641,18 @@ func CreateTUNFromFileWithOptions(file *os.File, mtu int, options Options) (Devi
 		return nil, err
 	}
 
-	tun.hackListenerClosed.Lock()
-	go tun.routineNetlinkListener()
-	go tun.routineHackListener() // cross namespace
-
 	err = tun.setMTU(mtu)
 	if err != nil {
+		tun.netlinkCancel.Close()
 		unix.Close(tun.netlinkSock)
 		return nil, err
 	}
 
+	tun.hackListenerClosed.Lock()
+	go tun.routineNetlinkListener()
+	go tun.routineHackListener() // cross namespace
+
+	groupingReady = true
 	return tun, nil
 }
 
@@ -653,6 +675,7 @@ func CreateUnmonitoredTUNFromFDWithOptions(fd int, options Options) (Device, str
 	}
 	err = tun.initFromFlags(name, options)
 	if err != nil {
+		tun.closeReceiveGrouping()
 		return nil, "", err
 	}
 	return tun, name, err

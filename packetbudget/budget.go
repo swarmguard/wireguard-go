@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 // Package packetbudget accounts for backing storage shared by packet owners.
-// It does not account for metadata, kernel buffers, or native TUN storage.
+// It does not account for metadata, kernel buffers, or native TUN read scratch.
 package packetbudget
 
 import (

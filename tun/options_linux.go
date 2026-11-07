@@ -12,15 +12,27 @@ import (
 
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/packetbudget"
 )
 
 // Options configures a Linux TUN before it starts processing packets.
 // Zero options preserve the existing offload behaviour.
 type Options struct {
-	// DisableSegmentationOffloads disables TUN segmentation offloads and GRO.
-	// Framed descriptors retain checksum offload, completed during reads.
-	// Virtio framing, when present, is retained for interface status detection.
+	// DisableSegmentationOffloads disables outgoing TUN segmentation and the
+	// normal in-place GRO path. Framed descriptors retain checksum offload,
+	// completed during reads, and framing for interface status detection.
 	DisableSegmentationOffloads bool
+
+	// ReceiveGrouping combines compatible incoming TCP packets in private
+	// workspace before writing them to Linux. It requires disabled outgoing
+	// segmentation, virtio framing and a non-nil PacketBudget. Packets are
+	// grouped only within each Write call; no caller storage is retained.
+	ReceiveGrouping bool
+
+	// PacketBudget owns receive-grouping storage: twelve 16 KiB data buffers
+	// shared by all writers of this TUN. Setup fails if they cannot be reserved.
+	// The caller must keep the budget alive until the TUN is closed.
+	PacketBudget *packetbudget.Budget
 }
 
 // CreateTUN creates a Device with the provided name and MTU.
@@ -38,7 +50,9 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 	return CreateUnmonitoredTUNFromFDWithOptions(fd, Options{})
 }
 
-// PacketBufferCapabilities advertises the non-aggregating packet-atomic path.
+// PacketBufferCapabilities advertises packet-atomic reads and synchronous
+// writes that never need tail capacity in caller buffers. Receive grouping uses
+// separate owned workspace and therefore preserves both guarantees.
 func (tun *NativeTun) PacketBufferCapabilities() PacketBufferCapabilities {
 	return PacketBufferCapabilities{
 		ReadConsumesWholePacket: tun.noSegmentation,
@@ -50,6 +64,9 @@ func (tun *NativeTun) PacketBufferCapabilities() PacketBufferCapabilities {
 // retains checksum offload and disables segmentation offloads. The callback
 // permits testing ioctl failures without a kernel TUN.
 func (tun *NativeTun) configureOffloads(flags uint16, options Options, setOffloads func(int) error) error {
+	if options.ReceiveGrouping && (!options.DisableSegmentationOffloads || options.PacketBudget == nil || flags&unix.IFF_VNET_HDR == 0) {
+		return fmt.Errorf("receive grouping requires disabled segmentation, virtio framing and a packet budget")
+	}
 	tun.vnetHdr = flags&unix.IFF_VNET_HDR != 0
 	tun.noSegmentation = options.DisableSegmentationOffloads
 	tun.batchSize = 1
@@ -58,6 +75,9 @@ func (tun *NativeTun) configureOffloads(flags uint16, options Options, setOffloa
 			if err := setOffloads(unix.TUN_F_CSUM); err != nil {
 				return fmt.Errorf("configure checksum-only TUN offload: %w", err)
 			}
+		}
+		if options.ReceiveGrouping {
+			return tun.initReceiveGrouping(options.PacketBudget)
 		}
 		return nil
 	}

@@ -72,12 +72,18 @@ type tcpGROTable struct {
 }
 
 func newTCPGROTable() *tcpGROTable {
+	return newTCPGROTableSized(conn.IdealBatchSize)
+}
+
+// newTCPGROTableSized reserves bookkeeping for at most size input packets.
+
+func newTCPGROTableSized(size int) *tcpGROTable {
 	t := &tcpGROTable{
-		itemsByFlow: make(map[tcpFlowKey][]tcpGROItem, conn.IdealBatchSize),
-		itemsPool:   make([][]tcpGROItem, conn.IdealBatchSize),
+		itemsByFlow: make(map[tcpFlowKey][]tcpGROItem, size),
+		itemsPool:   make([][]tcpGROItem, size),
 	}
 	for i := range t.itemsPool {
-		t.itemsPool[i] = make([]tcpGROItem, 0, conn.IdealBatchSize)
+		t.itemsPool[i] = make([]tcpGROItem, 0, size)
 	}
 	return t
 }
@@ -180,12 +186,18 @@ type udpGROTable struct {
 }
 
 func newUDPGROTable() *udpGROTable {
+	return newUDPGROTableSized(conn.IdealBatchSize)
+}
+
+// newUDPGROTableSized reserves bookkeeping for at most size input packets.
+
+func newUDPGROTableSized(size int) *udpGROTable {
 	u := &udpGROTable{
-		itemsByFlow: make(map[udpFlowKey][]udpGROItem, conn.IdealBatchSize),
-		itemsPool:   make([][]udpGROItem, conn.IdealBatchSize),
+		itemsByFlow: make(map[udpFlowKey][]udpGROItem, size),
+		itemsPool:   make([][]udpGROItem, size),
 	}
 	for i := range u.itemsPool {
-		u.itemsPool[i] = make([]udpGROItem, 0, conn.IdealBatchSize)
+		u.itemsPool[i] = make([]udpGROItem, 0, size)
 	}
 	return u
 }
