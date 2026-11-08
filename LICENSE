@@ -15,3 +15,105 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+------------------------------------------------------------------------
+Additional notices for 32-bit ARM packet encryption
+------------------------------------------------------------------------
+
+Tailscale ARM wrappers and translation tools (BSD-3-Clause)
+
+Source: tailscale/wireguard-go
+Revision: b884e294b6d810f3bf1c24c3fabc8398d867604a
+https://github.com/tailscale/wireguard-go/tree/b884e294b6d810f3bf1c24c3fabc8398d867604a/tsasm/arm
+
+The imported Go wrappers and tests under tsasm/arm/chacha20 and
+tsasm/arm/poly1305, tsasm/arm/chacha20poly1305/chacha20poly1305.go,
+and the translation tools under tsasm/arm/regen carry BSD-3-Clause
+SPDX notices. Their license terms follow.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+------------------------------------------------------------------------
+AEAD compatibility tests (MIT)
+
+Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
+
+The imported tsasm/arm/chacha20poly1305/aead_compat_test.go retains
+this copyright notice and is covered by the MIT permission and disclaimer
+at the start of this file.
+
+------------------------------------------------------------------------
+CryptoGAMS-derived assembly and upstream attribution
+
+The BSD option is used for the CryptoGAMS-derived assembly. The full
+upstream notice and attribution from tsasm/arm/NOTICE follow verbatim.
+
+ARM wrappers and assembly translation tools are imported from
+https://github.com/tailscale/wireguard-go/tree/b884e294b6d810f3bf1c24c3fabc8398d867604a/tsasm/arm
+and retain their BSD-3-Clause SPDX notices. AEAD compatibility tests retain their WireGuard MIT notice.
+
+Generated assembly is derived from CryptoGAMS. Its full notice follows;
+retain it in source distributions and binary distribution materials.
+
+Copyright (c) 2006, CRYPTOGAMS by <appro@openssl.org>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+      * Redistributions of source code must retain copyright
+        notices, this list of conditions and the following
+        disclaimer.
+
+      * Redistributions in binary form must reproduce the above
+        copyright notice, this list of conditions and the following
+        disclaimer in the documentation and/or other materials
+        provided with the distribution.
+
+      * Neither the name of the CRYPTOGAMS nor the names of its
+        copyright holder and contributors may be used to endorse or
+        promote products derived from this software without specific
+        prior written permission.
+
+ALTERNATIVELY, provided that this notice is retained in full, this
+product may be distributed under the terms of the GNU General Public
+License (GPL), in which case the provisions of the GPL apply INSTEAD
+OF those given above.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
