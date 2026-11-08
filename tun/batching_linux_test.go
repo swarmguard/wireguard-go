@@ -146,7 +146,7 @@ func TestOffloadOptions(t *testing.T) {
 					}
 					return nil
 				})
-				if dev.noSegmentation != disabled || dev.vnetHdr != framed {
+				if dev.noSegmentation != disabled || dev.vnetHdr != framed || dev.readBatchPackets != 1 {
 					t.Fatal("settings/framing changed")
 				}
 				if framed && fail == 0 {

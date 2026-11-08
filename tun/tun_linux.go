@@ -38,6 +38,7 @@ type NativeTun struct {
 	batchSize               int
 	vnetHdr                 bool
 	noSegmentation          bool
+	readBatchPackets        int // immutable after constructor setup
 	udpGSO                  bool
 	receiveGrouping         *receiveGrouping
 
@@ -552,6 +553,9 @@ func (tun *NativeTun) initFromFlags(name string, options Options) error {
 		err = tun.configureOffloads(ifr.Uint16(), options, func(flags int) error {
 			return unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, flags)
 		})
+		if err == nil {
+			err = tun.configureReadyReader(fd)
+		}
 	}); e != nil {
 		return e
 	}
@@ -599,7 +603,9 @@ func CreateTUNWithOptions(name string, mtu int, options Options) (Device, error)
 }
 
 // CreateTUNFromFileWithOptions creates a Device with the provided MTU and offload settings.
-// Descriptor ownership is the same as CreateTUNFromFile.
+// Descriptor ownership is the same as CreateTUNFromFile. When ready-read batching
+// is enabled, a nonblocking file must remain nonblocking for the device lifetime.
+// Use SyscallConn rather than File.Fd, which can switch a file to blocking mode.
 func CreateTUNFromFileWithOptions(file *os.File, mtu int, options Options) (Device, error) {
 	tun := &NativeTun{
 		tunFile:                 file,

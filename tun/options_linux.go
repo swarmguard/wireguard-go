@@ -29,6 +29,12 @@ type Options struct {
 	// grouped only within each Write call; no caller storage is retained.
 	ReceiveGrouping bool
 
+	// ReadBatchPackets bounds ready reads when receive grouping is enabled.
+	// Zero or one keeps single-packet reads. Values from 2 through 128 require
+	// ReceiveGrouping and a nonblocking descriptor; blocking files keep the
+	// single-packet reader. No timer or packet storage is added.
+	ReadBatchPackets int
+
 	// PacketBudget owns receive-grouping storage: twelve 16 KiB data buffers
 	// shared by all writers of this TUN. Setup fails if they cannot be reserved.
 	// The caller must keep the budget alive until the TUN is closed.
@@ -64,12 +70,19 @@ func (tun *NativeTun) PacketBufferCapabilities() PacketBufferCapabilities {
 // retains checksum offload and disables segmentation offloads. The callback
 // permits testing ioctl failures without a kernel TUN.
 func (tun *NativeTun) configureOffloads(flags uint16, options Options, setOffloads func(int) error) error {
+	if options.ReadBatchPackets < 0 || options.ReadBatchPackets > 128 {
+		return fmt.Errorf("TUN read batch capacity must be between 0 and 128 packets")
+	}
+	if options.ReadBatchPackets > 1 && !options.ReceiveGrouping {
+		return fmt.Errorf("TUN read batching requires receive grouping")
+	}
 	if options.ReceiveGrouping && (!options.DisableSegmentationOffloads || options.PacketBudget == nil || flags&unix.IFF_VNET_HDR == 0) {
 		return fmt.Errorf("receive grouping requires disabled segmentation, virtio framing and a packet budget")
 	}
 	tun.vnetHdr = flags&unix.IFF_VNET_HDR != 0
 	tun.noSegmentation = options.DisableSegmentationOffloads
 	tun.batchSize = 1
+	tun.readBatchPackets = 1
 	if tun.noSegmentation {
 		if tun.vnetHdr {
 			if err := setOffloads(unix.TUN_F_CSUM); err != nil {
@@ -77,7 +90,11 @@ func (tun *NativeTun) configureOffloads(flags uint16, options Options, setOffloa
 			}
 		}
 		if options.ReceiveGrouping {
-			return tun.initReceiveGrouping(options.PacketBudget)
+			if err := tun.initReceiveGrouping(options.PacketBudget); err != nil {
+				return err
+			}
+			tun.readBatchPackets = max(1, options.ReadBatchPackets)
+			return nil
 		}
 		return nil
 	}
@@ -95,11 +112,16 @@ func (tun *NativeTun) configureOffloads(flags uint16, options Options, setOffloa
 	return nil
 }
 
-// readWithoutSegmentation reads one complete packet before checking the caller's
-// capacity, so short buffers cannot silently truncate it. The caller holds readOpMu.
+// readWithoutSegmentation consumes complete packets before checking caller
+// capacity, so short buffers cannot silently truncate them. The caller holds readOpMu.
 func (tun *NativeTun) readWithoutSegmentation(bufs [][]byte, sizes []int, offset int) (int, error) {
 	if len(bufs) == 0 || len(sizes) == 0 || offset < 0 || offset > len(bufs[0]) {
 		return 0, io.ErrShortBuffer
+	}
+	// Drain only packets already ready for this managed compact reader. The
+	// existing scratch still consumes complete packets before capacity checks.
+	if tun.readBatchPackets > 1 {
+		return tun.readReadyPackets(bufs, sizes, offset)
 	}
 	select {
 	case err := <-tun.errors:
