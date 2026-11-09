@@ -1,0 +1,33 @@
+Native ARM64 crypto provenance
+=============================
+
+The portable implementations, ARM64 ChaCha20 assembly, public wrappers, alias
+helpers, and upstream test/vector files derive from golang.org/x/crypto v0.55.0:
+
+  https://github.com/golang/crypto/tree/v0.55.0/chacha20
+  https://github.com/golang/crypto/tree/v0.55.0/chacha20poly1305
+  https://github.com/golang/crypto/tree/v0.55.0/internal/poly1305
+  https://github.com/golang/crypto/tree/v0.55.0/internal/alias
+
+Their original copyright notices are retained. The repository-root LICENSE includes the upstream BSD 3-clause license
+and ARM64 attribution for generated FOSS declarations.
+
+Local adaptations:
+
+* Imports point to these local packages and their alias helper.
+* ChaCha20 keeps upstream ARM64 vector assembly. The buffered XOR in its Go
+  wrapper uses crypto/subtle.XORBytes instead of a byte-at-a-time loop.
+* Poly1305 sum_arm64.s is a new ARM64 translation of the saturated-limb
+  algorithm in upstream sum_generic.go and sum_loong64.s. sum_arm64.go is
+  adapted from sum_asm.go, with a full-block assembly entry point and a Go
+  fallback for partial blocks. It has not received independent review.
+* Build constraints retain a portable fallback on non-ARM64, purego and
+  non-gc builds. The AEAD dispatch uses the generic wrapper with these local
+  ChaCha20 and Poly1305 implementations.
+* FIPS-only checks use crypto/fips140.Enforced on Go 1.26 and later. Older
+  toolchains retain the behavior of this module's existing dependency.
+* Differential, carry-state, concurrent-use, and fuzz tests were added locally.
+
+This implementation includes no OpenSSL source, generated OpenSSL assembly,
+OpenSSL calls, or CGO dependency. The separate 32-bit ARM implementation under
+tsasm/arm has its own provenance and is unchanged by this addition.
