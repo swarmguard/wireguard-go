@@ -86,9 +86,10 @@ func TestSmallBufferValidation(t *testing.T) {
 // TestSmallBufferBorrowedWrite preserves ownership and avoids scratch storage.
 func TestSmallBufferBorrowedWrite(t *testing.T) {
 	t.Parallel()
-	for _, plain := range []bool{false, true} {
+	for _, mode := range []struct{ plain, grows bool }{{false, false}, {true, false}, {true, true}} {
+		plain := mode.plain && !mode.grows
 		budget := newTestBudget(t)
-		dev := &Device{packetBudget: budget, packetBuffers: tun.PacketBufferCapabilities{WriteUsesPacketLength: plain}}
+		dev := &Device{packetBudget: budget, packetBuffers: tun.PacketBufferCapabilities{WriteUsesPacketLength: mode.plain, WriteMayGrowPacketStorage: mode.grows}}
 		source := &budgetBorrowed{budget: budget, buf: budget.Get(2048, false)}
 		copy(source.buf[16:], "plaintext")
 		elem := &QueueInboundElement{borrowedPacket: source, packet: source.buf[16:25]}
@@ -310,4 +311,17 @@ func (b *observedSmallBind) Open(port uint16) ([]conn.ReceiveBorrowedFunc, uint1
 		}
 	}
 	return fns, actual, err
+}
+
+// TestSmallBufferPrivateGrowth rejects TUN storage outside the packet budget.
+func TestSmallBufferPrivateGrowth(t *testing.T) {
+	t.Parallel()
+	budget := newTestBudget(t)
+	defer budget.Close()
+	dev := &Device{messageBufferSize: 2048, packetBudget: budget, packetBuffers: tun.PacketBufferCapabilities{
+		ReadConsumesWholePacket: true, WriteUsesPacketLength: true, WriteMayGrowPacketStorage: true,
+	}}
+	if err := dev.validatePacketBufferSize(1280); err == nil {
+		t.Fatal("small buffers allowed private TUN growth")
+	}
 }

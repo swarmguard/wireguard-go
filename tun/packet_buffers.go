@@ -16,6 +16,10 @@ type PacketBufferCapabilities struct {
 	// specified by offset, but does not retain buffers after returning,
 	// including on errors.
 	WriteUsesPacketLength bool
+
+	// WriteMayGrowPacketStorage means packet-sized writes may allocate private
+	// aggregation storage. Budget-managed callers must supply full buffers.
+	WriteMayGrowPacketStorage bool
 }
 
 // PacketBuffers returns a device's explicitly advertised buffer guarantees.

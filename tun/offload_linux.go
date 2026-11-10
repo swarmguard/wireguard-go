@@ -67,6 +67,7 @@ type tcpFlowKey struct {
 
 // tcpGROTable holds flow and coalescing information for the purposes of TCP GRO.
 type tcpGROTable struct {
+	promotion   *groPromotion
 	itemsByFlow map[tcpFlowKey][]tcpGROItem
 	itemsPool   [][]tcpGROItem
 }
@@ -181,6 +182,7 @@ type udpFlowKey struct {
 
 // udpGROTable holds flow and coalescing information for the purposes of UDP GRO.
 type udpGROTable struct {
+	promotion   *groPromotion
 	itemsByFlow map[udpFlowKey][]udpGROItem
 	itemsPool   [][]udpGROItem
 }
@@ -423,15 +425,16 @@ const (
 
 // coalesceUDPPackets attempts to coalesce pkt with the packet described by
 // item, and returns the outcome.
-func coalesceUDPPackets(pkt []byte, item *udpGROItem, bufs [][]byte, bufsOffset int, isV6 bool) coalesceResult {
+func coalesceUDPPackets(pkt []byte, item *udpGROItem, bufs [][]byte, bufsOffset int, isV6 bool, promotion *groPromotion) coalesceResult {
 	pktHead := bufs[item.bufsIndex][bufsOffset:] // the packet that will end up at the front
 	headersLen := item.iphLen + udphLen
 	coalescedLen := len(bufs[item.bufsIndex][bufsOffset:]) + len(pkt) - int(headersLen)
 
 	if cap(pktHead)-bufsOffset < coalescedLen {
-		// We don't want to allocate a new underlying array if capacity is
-		// too small.
-		return coalesceInsufficientCap
+		if !promotion.ensure(bufs, int(item.bufsIndex), coalescedLen+2*bufsOffset) {
+			return coalesceInsufficientCap
+		}
+		pktHead = bufs[item.bufsIndex][bufsOffset:]
 	}
 	if item.numMerged == 0 {
 		if item.cSumKnownInvalid || !checksumValid(bufs[item.bufsIndex][bufsOffset:], item.iphLen, unix.IPPROTO_UDP, isV6) {
@@ -453,7 +456,7 @@ func coalesceUDPPackets(pkt []byte, item *udpGROItem, bufs [][]byte, bufsOffset 
 // item, and returns the outcome. This function may swap bufs elements in the
 // event of a prepend as item's bufs index is already being tracked for writing
 // to a Device.
-func coalesceTCPPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize uint16, seq uint32, pshSet bool, item *tcpGROItem, bufs [][]byte, bufsOffset int, isV6 bool) coalesceResult {
+func coalesceTCPPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize uint16, seq uint32, pshSet bool, item *tcpGROItem, bufs [][]byte, bufsOffset int, isV6 bool, promotion *groPromotion) coalesceResult {
 	var pktHead []byte // the packet that will end up at the front
 	headersLen := item.iphLen + item.tcphLen
 	coalescedLen := len(bufs[item.bufsIndex][bufsOffset:]) + len(pkt) - int(headersLen)
@@ -462,9 +465,11 @@ func coalesceTCPPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize
 	if mode == coalescePrepend {
 		pktHead = pkt
 		if cap(pkt)-bufsOffset < coalescedLen {
-			// We don't want to allocate a new underlying array if capacity is
-			// too small.
-			return coalesceInsufficientCap
+			if !promotion.ensure(bufs, pktBuffsIndex, coalescedLen+2*bufsOffset) {
+				return coalesceInsufficientCap
+			}
+			pkt = bufs[pktBuffsIndex][bufsOffset:]
+			pktHead = pkt
 		}
 		if pshSet {
 			return coalescePSHEnding
@@ -487,9 +492,10 @@ func coalesceTCPPackets(mode canCoalesce, pkt []byte, pktBuffsIndex int, gsoSize
 	} else {
 		pktHead = bufs[item.bufsIndex][bufsOffset:]
 		if cap(pktHead)-bufsOffset < coalescedLen {
-			// We don't want to allocate a new underlying array if capacity is
-			// too small.
-			return coalesceInsufficientCap
+			if !promotion.ensure(bufs, int(item.bufsIndex), coalescedLen+2*bufsOffset) {
+				return coalesceInsufficientCap
+			}
+			pktHead = bufs[item.bufsIndex][bufsOffset:]
 		}
 		if item.numMerged == 0 {
 			if !checksumValid(bufs[item.bufsIndex][bufsOffset:], item.iphLen, unix.IPPROTO_TCP, isV6) {
@@ -612,7 +618,7 @@ func tcpGRO(bufs [][]byte, offset int, pktI int, table *tcpGROTable, isV6 bool) 
 		item := items[i]
 		can := tcpPacketsCanCoalesce(pkt, uint8(iphLen), uint8(tcphLen), seq, pshSet, gsoSize, item, bufs, offset)
 		if can != coalesceUnavailable {
-			result := coalesceTCPPackets(can, pkt, pktI, gsoSize, seq, pshSet, &item, bufs, offset, isV6)
+			result := coalesceTCPPackets(can, pkt, pktI, gsoSize, seq, pshSet, &item, bufs, offset, isV6, table.promotion)
 			switch result {
 			case coalesceSuccess:
 				table.updateAt(item, i)
@@ -848,7 +854,7 @@ func udpGRO(bufs [][]byte, offset int, pktI int, table *udpGROTable, isV6 bool) 
 	can := udpPacketsCanCoalesce(pkt, uint8(iphLen), gsoSize, item, bufs, offset)
 	var pktCSumKnownInvalid bool
 	if can == coalesceAppend {
-		result := coalesceUDPPackets(pkt, &item, bufs, offset, isV6)
+		result := coalesceUDPPackets(pkt, &item, bufs, offset, isV6, table.promotion)
 		switch result {
 		case coalesceSuccess:
 			table.updateAt(item, len(items)-1)

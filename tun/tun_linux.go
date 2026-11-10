@@ -51,6 +51,7 @@ type NativeTun struct {
 	readOpMu sync.Mutex                    // readOpMu guards readBuff
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
+	promotion   groPromotion
 	writeOpMu   sync.Mutex // writeOpMu guards grouping workspace and GRO tables
 	toWrite     []int
 	tcpGROTable *tcpGROTable
@@ -336,6 +337,10 @@ func (tun *NativeTun) nameSlow() (string, error) {
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
+	if tun.promotion.closed {
+		tun.writeOpMu.Unlock()
+		return 0, os.ErrClosed
+	}
 	if tun.noSegmentation {
 		defer tun.writeOpMu.Unlock()
 		if tun.receiveGrouping != nil {
@@ -343,9 +348,17 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 		}
 		return tun.writePlain(bufs, offset)
 	}
+	if tun.vnetHdr {
+		tun.promotion.begin(bufs)
+		tun.tcpGROTable.promotion = &tun.promotion
+		tun.udpGROTable.promotion = &tun.promotion
+	}
 	defer func() {
 		tun.tcpGROTable.reset()
 		tun.udpGROTable.reset()
+		if tun.vnetHdr {
+			tun.promotion.finish(bufs)
+		}
 		tun.writeOpMu.Unlock()
 	}()
 	var (
@@ -505,6 +518,7 @@ func (tun *NativeTun) Close() error {
 		err2 = tun.tunFile.Close()
 		tun.writeOpMu.Lock()
 		tun.closeReceiveGrouping()
+		tun.promotion = groPromotion{closed: true}
 		tun.writeOpMu.Unlock()
 	})
 	if err1 != nil {

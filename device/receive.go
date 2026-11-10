@@ -95,7 +95,10 @@ func (elem *QueueInboundElement) tunWriteBuffer(device *Device, scratch *[][]byt
 		return nil
 	}
 	writeLen := MessageTransportOffsetContent + len(elem.packet)
-	if device.packetBuffers.WriteUsesPacketLength && len(backingBuffer) >= writeLen {
+	// Keep aggregation storage inside the packet budget when the TUN would
+	// otherwise grow short buffers privately.
+	if device.packetBuffers.WriteUsesPacketLength &&
+		(device.packetBudget == nil || !device.packetBuffers.WriteMayGrowPacketStorage) && len(backingBuffer) >= writeLen {
 		return backingBuffer[:writeLen]
 	}
 	if cap(backingBuffer) >= MessageTransportOffsetContent+MaxContentSize {

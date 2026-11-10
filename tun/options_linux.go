@@ -61,8 +61,9 @@ func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
 // separate owned workspace and therefore preserves both guarantees.
 func (tun *NativeTun) PacketBufferCapabilities() PacketBufferCapabilities {
 	return PacketBufferCapabilities{
-		ReadConsumesWholePacket: tun.noSegmentation,
-		WriteUsesPacketLength:   tun.noSegmentation,
+		ReadConsumesWholePacket:   tun.noSegmentation,
+		WriteUsesPacketLength:     tun.noSegmentation || tun.vnetHdr,
+		WriteMayGrowPacketStorage: tun.vnetHdr && !tun.noSegmentation,
 	}
 }
 
