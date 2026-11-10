@@ -48,8 +48,9 @@ type NativeTun struct {
 	nameCache string    // name of interface
 	nameErr   error
 
-	readOpMu sync.Mutex                    // readOpMu guards readBuff
-	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
+	readOpMu    sync.Mutex                    // guards readBuff and pendingRead
+	readBuff    [virtioNetHdrLen + 65535]byte // includes the virtio header when enabled
+	pendingRead int                           // raw bytes deferred until the next batch has enough space
 
 	promotion   groPromotion
 	writeOpMu   sync.Mutex // writeOpMu guards grouping workspace and GRO tables
@@ -401,6 +402,9 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 		return 0, err
 	}
 	in = in[virtioNetHdrLen:]
+	if len(in) == 0 {
+		return 0, errors.New("empty TUN packet")
+	}
 	if hdr.gsoType == unix.VIRTIO_NET_HDR_GSO_NONE {
 		if hdr.flags&unix.VIRTIO_NET_HDR_F_NEEDS_CSUM != 0 {
 			// This means CHECKSUM_PARTIAL in skb context. We are responsible
@@ -467,6 +471,14 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 		return 0, fmt.Errorf("end of checksum offset (%d) exceeds packet length (%d)", cSumAt+1, len(in))
 	}
 
+	if hdr.gsoSize == 0 {
+		return 0, errors.New("zero GSO segment size")
+	}
+	segments := (len(in) - int(hdr.hdrLen) + int(hdr.gsoSize) - 1) / int(hdr.gsoSize)
+	if segments > len(bufs) {
+		// Leave the raw record untouched so a partially filled batch can defer it.
+		return 0, ErrTooManySegments
+	}
 	return gsoSplit(in, hdr, bufs, sizes, offset, ipVersion == 6)
 }
 
@@ -480,10 +492,10 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	case err := <-tun.errors:
 		return 0, err
 	default:
-		readInto := bufs[0][offset:]
 		if tun.vnetHdr {
-			readInto = tun.readBuff[:]
+			return tun.readQueuedRecords(bufs, sizes, offset)
 		}
+		readInto := bufs[0][offset:]
 		n, err := tun.tunFile.Read(readInto)
 		if errors.Is(err, syscall.EBADFD) {
 			err = os.ErrClosed
@@ -491,12 +503,8 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 		if err != nil {
 			return 0, err
 		}
-		if tun.vnetHdr {
-			return handleVirtioRead(readInto[:n], bufs, sizes, offset)
-		} else {
-			sizes[0] = n
-			return 1, nil
-		}
+		sizes[0] = n
+		return 1, nil
 	}
 }
 
@@ -516,6 +524,9 @@ func (tun *NativeTun) Close() error {
 			close(tun.events)
 		}
 		err2 = tun.tunFile.Close()
+		tun.readOpMu.Lock()
+		tun.pendingRead = 0
+		tun.readOpMu.Unlock()
 		tun.writeOpMu.Lock()
 		tun.closeReceiveGrouping()
 		tun.promotion = groPromotion{closed: true}
