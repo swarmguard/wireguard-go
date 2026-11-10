@@ -23,9 +23,9 @@ type outboundQueue struct {
 	wg sync.WaitGroup
 }
 
-func newOutboundQueue() *outboundQueue {
+func newOutboundQueue(capacity int) *outboundQueue {
 	q := &outboundQueue{
-		c: make(chan *QueueOutboundElementsContainer, QueueOutboundSize),
+		c: make(chan *QueueOutboundElementsContainer, capacity),
 	}
 	q.wg.Add(1)
 	go func() {
@@ -41,9 +41,9 @@ type inboundQueue struct {
 	wg sync.WaitGroup
 }
 
-func newInboundQueue() *inboundQueue {
+func newInboundQueue(capacity int) *inboundQueue {
 	q := &inboundQueue{
-		c: make(chan *QueueInboundElementsContainer, QueueInboundSize),
+		c: make(chan *QueueInboundElementsContainer, capacity),
 	}
 	q.wg.Add(1)
 	go func() {
@@ -59,9 +59,9 @@ type handshakeQueue struct {
 	wg sync.WaitGroup
 }
 
-func newHandshakeQueue() *handshakeQueue {
+func newHandshakeQueue(capacity int) *handshakeQueue {
 	q := &handshakeQueue{
-		c: make(chan QueueHandshakeElement, QueueHandshakeSize),
+		c: make(chan QueueHandshakeElement, capacity),
 	}
 	q.wg.Add(1)
 	go func() {
@@ -81,7 +81,7 @@ type autodrainingInboundQueue struct {
 // some other means, such as sending a sentinel nil values.
 func newAutodrainingInboundQueue(device *Device) *autodrainingInboundQueue {
 	q := &autodrainingInboundQueue{
-		c: make(chan *QueueInboundElementsContainer, QueueInboundSize),
+		c: make(chan *QueueInboundElementsContainer, device.queueCapacity(QueueInboundSize)),
 	}
 	runtime.SetFinalizer(q, device.flushInboundQueue)
 	return q
@@ -91,6 +91,9 @@ func (device *Device) flushInboundQueue(q *autodrainingInboundQueue) {
 	for {
 		select {
 		case elemsContainer := <-q.c:
+			if elemsContainer == nil {
+				continue
+			}
 			elemsContainer.Lock()
 			for _, elem := range elemsContainer.elems {
 				elem.releasePacket(device)
@@ -114,7 +117,7 @@ type autodrainingOutboundQueue struct {
 // All sends to the channel must be best-effort, because there may be no receivers.
 func newAutodrainingOutboundQueue(device *Device) *autodrainingOutboundQueue {
 	q := &autodrainingOutboundQueue{
-		c: make(chan *QueueOutboundElementsContainer, QueueOutboundSize),
+		c: make(chan *QueueOutboundElementsContainer, device.queueCapacity(QueueOutboundSize)),
 	}
 	runtime.SetFinalizer(q, device.flushOutboundQueue)
 	return q
@@ -124,6 +127,9 @@ func (device *Device) flushOutboundQueue(q *autodrainingOutboundQueue) {
 	for {
 		select {
 		case elemsContainer := <-q.c:
+			if elemsContainer == nil {
+				continue
+			}
 			elemsContainer.Lock()
 			for _, elem := range elemsContainer.elems {
 				device.PutMessageBuffer(elem.buffer)

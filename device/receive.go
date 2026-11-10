@@ -16,18 +16,19 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/packetbudget"
 )
 
 type QueueHandshakeElement struct {
 	msgType        uint32
 	packet         []byte
 	endpoint       conn.Endpoint
-	buffer         *[MaxMessageSize]byte
+	buffer         []byte
 	borrowedPacket conn.BorrowedPacket
 }
 
 type QueueInboundElement struct {
-	buffer         *[MaxMessageSize]byte
+	buffer         []byte
 	packet         []byte
 	counter        uint64
 	keypair        *Keypair
@@ -38,7 +39,8 @@ type QueueInboundElement struct {
 
 type QueueInboundElementsContainer struct {
 	sync.Mutex
-	elems []*QueueInboundElement
+	elems   []*QueueInboundElement
+	control bool
 }
 
 // clearPointers clears elem fields that contain pointers.
@@ -87,17 +89,30 @@ func (elem *QueueInboundElement) backingBuffer() []byte {
 	return nil
 }
 
-func (elem *QueueInboundElement) tunWriteBuffer(device *Device, scratch *[]*[MaxMessageSize]byte) []byte {
+func (elem *QueueInboundElement) tunWriteBuffer(device *Device, scratch *[][]byte) []byte {
 	backingBuffer := elem.backingBuffer()
 	if backingBuffer == nil {
 		return nil
 	}
 	writeLen := MessageTransportOffsetContent + len(elem.packet)
+	// Keep aggregation storage inside the packet budget when the TUN would
+	// otherwise grow short buffers privately.
+	if device.packetBuffers.WriteUsesPacketLength &&
+		(device.packetBudget == nil || !device.packetBuffers.WriteMayGrowPacketStorage) && len(backingBuffer) >= writeLen {
+		return backingBuffer[:writeLen]
+	}
 	if cap(backingBuffer) >= MessageTransportOffsetContent+MaxContentSize {
 		return backingBuffer[:writeLen]
 	}
 
 	buffer := device.GetMessageBuffer()
+	if buffer == nil {
+		return nil
+	}
+	if writeLen > len(buffer) {
+		device.PutMessageBuffer(buffer)
+		return nil
+	}
 	copy(buffer[MessageTransportOffsetContent:writeLen], elem.packet)
 	*scratch = append(*scratch, buffer)
 	return buffer[:writeLen]
@@ -135,6 +150,7 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 		count       int
 		deathSpiral int
 		elemsByPeer = make(map[*Peer]*QueueInboundElementsContainer, maxBatchSize)
+		pending     = make([]inboundDispatch, 0, maxBatchSize)
 	)
 
 	for {
@@ -162,7 +178,7 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 				continue
 			}
 			packet := borrowedPacket.Bytes()
-			if len(packet) < MinMessageSize {
+			if len(packet) < MinMessageSize || len(packet) > device.packetBufferSize() {
 				borrowedPacket.Release()
 				packets[i] = nil
 				continue
@@ -225,11 +241,19 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 				elem.counter = 0
 				elem.msgType = msgType
 
+				control := device.packetBudget != nil && packetbudget.IsControl(packet)
 				elemsForPeer, ok := elemsByPeer[peer]
+				// Start a fresh container at each control/data boundary for this peer.
+				// Publish those containers in arrival order; never elevate a data batch.
+				if device.packetBudget != nil && ok && elemsForPeer.control != control {
+					ok = false
+				}
 				if !ok {
 					elemsForPeer = device.GetInboundElementsContainer()
+					elemsForPeer.control = control
 					elemsForPeer.Lock()
 					elemsByPeer[peer] = elemsForPeer
+					pending = append(pending, inboundDispatch{peer: peer, control: control, container: elemsForPeer})
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
 				packets[i] = nil
@@ -266,27 +290,23 @@ func (device *Device) RoutineReceiveIncomingBorrowed(maxBatchSize int, recv conn
 				endpoint:       borrowedPacket.Endpoint(),
 				borrowedPacket: borrowedPacket,
 			}
-			select {
-			case device.queue.handshake.c <- handshakeElem:
-				packets[i] = nil
-			default:
+			if !device.admitHandshake(handshakeElem) {
 				borrowedPacket.Release()
-				packets[i] = nil
 			}
+			packets[i] = nil
 		}
-		for peer, elemsContainer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.queue.inbound.c <- elemsContainer
-				device.queue.decryption.c <- elemsContainer
-			} else {
-				for _, elem := range elemsContainer.elems {
+		for index, batch := range pending {
+			if !device.admitInbound(batch.peer, batch.container, batch.control) {
+				for _, elem := range batch.container.elems {
 					elem.releasePacket(device)
 					device.PutInboundElement(elem)
 				}
-				device.PutInboundElementsContainer(elemsContainer)
+				device.PutInboundElementsContainer(batch.container)
 			}
-			delete(elemsByPeer, peer)
+			delete(elemsByPeer, batch.peer)
+			pending[index] = inboundDispatch{}
 		}
+		pending = pending[:0]
 	}
 }
 
@@ -492,7 +512,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 	device.log.Verbosef("%v - Routine: sequential receiver - started", peer)
 
 	bufs := make([][]byte, 0, maxBatchSize)
-	tunWriteBuffers := make([]*[MaxMessageSize]byte, 0, maxBatchSize)
+	tunWriteBuffers := make([][]byte, 0, maxBatchSize)
 
 	for elemsContainer := range peer.queue.inbound.c {
 		if elemsContainer == nil {

@@ -18,7 +18,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/rwcancel"
 )
 
@@ -38,7 +37,10 @@ type NativeTun struct {
 	statusListenersShutdown chan struct{}
 	batchSize               int
 	vnetHdr                 bool
+	noSegmentation          bool
+	readBatchPackets        int // immutable after constructor setup
 	udpGSO                  bool
+	receiveGrouping         *receiveGrouping
 
 	closeOnce sync.Once
 
@@ -49,7 +51,8 @@ type NativeTun struct {
 	readOpMu sync.Mutex                    // readOpMu guards readBuff
 	readBuff [virtioNetHdrLen + 65535]byte // if vnetHdr every read() is prefixed by virtioNetHdr
 
-	writeOpMu   sync.Mutex // writeOpMu guards toWrite, tcpGROTable
+	promotion   groPromotion
+	writeOpMu   sync.Mutex // writeOpMu guards grouping workspace and GRO tables
 	toWrite     []int
 	tcpGROTable *tcpGROTable
 	udpGROTable *udpGROTable
@@ -334,9 +337,28 @@ func (tun *NativeTun) nameSlow() (string, error) {
 
 func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	tun.writeOpMu.Lock()
+	if tun.promotion.closed {
+		tun.writeOpMu.Unlock()
+		return 0, os.ErrClosed
+	}
+	if tun.noSegmentation {
+		defer tun.writeOpMu.Unlock()
+		if tun.receiveGrouping != nil {
+			return tun.writeGrouped(bufs, offset)
+		}
+		return tun.writePlain(bufs, offset)
+	}
+	if tun.vnetHdr {
+		tun.promotion.begin(bufs)
+		tun.tcpGROTable.promotion = &tun.promotion
+		tun.udpGROTable.promotion = &tun.promotion
+	}
 	defer func() {
 		tun.tcpGROTable.reset()
 		tun.udpGROTable.reset()
+		if tun.vnetHdr {
+			tun.promotion.finish(bufs)
+		}
 		tun.writeOpMu.Unlock()
 	}()
 	var (
@@ -451,6 +473,9 @@ func handleVirtioRead(in []byte, bufs [][]byte, sizes []int, offset int) (int, e
 func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 	tun.readOpMu.Lock()
 	defer tun.readOpMu.Unlock()
+	if tun.noSegmentation {
+		return tun.readWithoutSegmentation(bufs, sizes, offset)
+	}
 	select {
 	case err := <-tun.errors:
 		return 0, err
@@ -491,6 +516,10 @@ func (tun *NativeTun) Close() error {
 			close(tun.events)
 		}
 		err2 = tun.tunFile.Close()
+		tun.writeOpMu.Lock()
+		tun.closeReceiveGrouping()
+		tun.promotion = groPromotion{closed: true}
+		tun.writeOpMu.Unlock()
 	})
 	if err1 != nil {
 		return err1
@@ -508,7 +537,7 @@ const (
 	tunUDPOffloads = unix.TUN_F_USO4 | unix.TUN_F_USO6
 )
 
-func (tun *NativeTun) initFromFlags(name string) error {
+func (tun *NativeTun) initFromFlags(name string, options Options) error {
 	sc, err := tun.tunFile.SyscallConn()
 	if err != nil {
 		return err
@@ -525,21 +554,21 @@ func (tun *NativeTun) initFromFlags(name string) error {
 		if err != nil {
 			return
 		}
-		got := ifr.Uint16()
-		if got&unix.IFF_VNET_HDR != 0 {
-			// tunTCPOffloads were added in Linux v2.6. We require their support
-			// if IFF_VNET_HDR is set.
-			err = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads)
+		if options.DisableSegmentationOffloads && ifr.Uint16()&unix.IFF_VNET_HDR != 0 {
+			err = configureCompactFraming(func() (int, error) {
+				return unix.IoctlGetInt(int(fd), unix.TUNGETVNETHDRSZ)
+			}, func() error {
+				return unix.IoctlSetPointerInt(int(fd), unix.TUNSETVNETLE, 1)
+			})
 			if err != nil {
 				return
 			}
-			tun.vnetHdr = true
-			tun.batchSize = conn.IdealBatchSize
-			// tunUDPOffloads were added in Linux v6.2. We do not return an
-			// error if they are unsupported at runtime.
-			tun.udpGSO = unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, tunTCPOffloads|tunUDPOffloads) == nil
-		} else {
-			tun.batchSize = 1
+		}
+		err = tun.configureOffloads(ifr.Uint16(), options, func(flags int) error {
+			return unix.IoctlSetInt(int(fd), unix.TUNSETOFFLOAD, flags)
+		})
+		if err == nil {
+			err = tun.configureReadyReader(fd)
 		}
 	}); e != nil {
 		return e
@@ -547,8 +576,8 @@ func (tun *NativeTun) initFromFlags(name string) error {
 	return err
 }
 
-// CreateTUN creates a Device with the provided name and MTU.
-func CreateTUN(name string, mtu int) (Device, error) {
+// CreateTUNWithOptions creates a Device with the provided name, MTU and offload settings.
+func CreateTUNWithOptions(name string, mtu int, options Options) (Device, error) {
 	nfd, err := unix.Open(cloneDevicePath, unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -559,6 +588,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 
 	ifr, err := unix.NewIfreq(name)
 	if err != nil {
+		unix.Close(nfd)
 		return nil, err
 	}
 	// IFF_VNET_HDR enables the "tun status hack" via routineHackListener()
@@ -566,6 +596,7 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI | unix.IFF_VNET_HDR)
 	err = unix.IoctlIfreq(nfd, unix.TUNSETIFF, ifr)
 	if err != nil {
+		unix.Close(nfd)
 		return nil, err
 	}
 
@@ -578,19 +609,23 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	// Note that the above -- open,ioctl,nonblock -- must happen prior to handing it to netpoll as below this line.
 
 	fd := os.NewFile(uintptr(nfd), cloneDevicePath)
-	return CreateTUNFromFile(fd, mtu)
+	dev, err := CreateTUNFromFileWithOptions(fd, mtu, options)
+	if err != nil {
+		fd.Close()
+	}
+	return dev, err
 }
 
-// CreateTUNFromFile creates a Device from an os.File with the provided MTU.
-func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
+// CreateTUNFromFileWithOptions creates a Device with the provided MTU and offload settings.
+// Descriptor ownership is the same as CreateTUNFromFile. When ready-read batching
+// is enabled, a nonblocking file must remain nonblocking for the device lifetime.
+// Use SyscallConn rather than File.Fd, which can switch a file to blocking mode.
+func CreateTUNFromFileWithOptions(file *os.File, mtu int, options Options) (Device, error) {
 	tun := &NativeTun{
 		tunFile:                 file,
 		events:                  make(chan Event, 5),
 		errors:                  make(chan error, 5),
 		statusListenersShutdown: make(chan struct{}),
-		tcpGROTable:             newTCPGROTable(),
-		udpGROTable:             newUDPGROTable(),
-		toWrite:                 make([]int, 0, conn.IdealBatchSize),
 	}
 
 	name, err := tun.Name()
@@ -598,10 +633,17 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	err = tun.initFromFlags(name)
+	err = tun.initFromFlags(name, options)
 	if err != nil {
+		tun.closeReceiveGrouping()
 		return nil, err
 	}
+	groupingReady := false
+	defer func() {
+		if !groupingReady {
+			tun.closeReceiveGrouping()
+		}
+	}()
 
 	// start event listener
 	tun.index, err = getIFIndex(name)
@@ -619,41 +661,41 @@ func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	tun.hackListenerClosed.Lock()
-	go tun.routineNetlinkListener()
-	go tun.routineHackListener() // cross namespace
-
 	err = tun.setMTU(mtu)
 	if err != nil {
+		tun.netlinkCancel.Close()
 		unix.Close(tun.netlinkSock)
 		return nil, err
 	}
 
+	tun.hackListenerClosed.Lock()
+	go tun.routineNetlinkListener()
+	go tun.routineHackListener() // cross namespace
+
+	groupingReady = true
 	return tun, nil
 }
 
-// CreateUnmonitoredTUNFromFD creates a Device from the provided file
-// descriptor.
-func CreateUnmonitoredTUNFromFD(fd int) (Device, string, error) {
+// CreateUnmonitoredTUNFromFDWithOptions creates an unmanaged Device with offload settings.
+// Descriptor ownership is the same as CreateUnmonitoredTUNFromFD.
+func CreateUnmonitoredTUNFromFDWithOptions(fd int, options Options) (Device, string, error) {
 	err := unix.SetNonblock(fd, true)
 	if err != nil {
 		return nil, "", err
 	}
 	file := os.NewFile(uintptr(fd), "/dev/tun")
 	tun := &NativeTun{
-		tunFile:     file,
-		events:      make(chan Event, 5),
-		errors:      make(chan error, 5),
-		tcpGROTable: newTCPGROTable(),
-		udpGROTable: newUDPGROTable(),
-		toWrite:     make([]int, 0, conn.IdealBatchSize),
+		tunFile: file,
+		events:  make(chan Event, 5),
+		errors:  make(chan error, 5),
 	}
 	name, err := tun.Name()
 	if err != nil {
 		return nil, "", err
 	}
-	err = tun.initFromFlags(name)
+	err = tun.initFromFlags(name, options)
 	if err != nil {
+		tun.closeReceiveGrouping()
 		return nil, "", err
 	}
 	return tun, name, err

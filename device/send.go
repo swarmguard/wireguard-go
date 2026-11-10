@@ -8,6 +8,7 @@ package device
 import (
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -46,11 +47,11 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer  *[MaxMessageSize]byte // slice holding the packet data
-	packet  []byte                // slice of "buffer" (always!)
-	nonce   uint64                // nonce for encryption
-	keypair *Keypair              // keypair for encryption
-	peer    *Peer                 // related peer
+	buffer  []byte   // slice holding the packet data
+	packet  []byte   // slice of "buffer" (always!)
+	nonce   uint64   // nonce for encryption
+	keypair *Keypair // keypair for encryption
+	peer    *Peer    // related peer
 }
 
 type QueueOutboundElementsContainer struct {
@@ -61,6 +62,10 @@ type QueueOutboundElementsContainer struct {
 func (device *Device) NewOutboundElement() *QueueOutboundElement {
 	elem := device.GetOutboundElement()
 	elem.buffer = device.GetMessageBuffer()
+	if elem.buffer == nil {
+		device.PutOutboundElement(elem)
+		return nil
+	}
 	elem.nonce = 0
 	// keypair and peer were cleared (if necessary) by clearPointers.
 	return elem
@@ -80,20 +85,43 @@ func (elem *QueueOutboundElement) clearPointers() {
 /* Queues a keepalive if no packets are queued for peer
  */
 func (peer *Peer) SendKeepalive() {
-	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		elem := peer.device.NewOutboundElement()
+	// With a packet budget, a keepalive that cannot be sent yet would hold a
+	// full message buffer in the staged queue until a session exists. Repeated
+	// keepalives for offline peers could then exhaust the shared budget and
+	// stop all data traffic. Start the handshake instead, as staging would;
+	// the handshake response handler sends a fresh keepalive.
+	if peer.device.packetBudget != nil && !peer.hasSendableKeypair() {
+		if peer.isRunning.Load() && peer.device.isUp() {
+			peer.SendHandshakeInitiation(false)
+		}
+		return
+	}
+	if (len(peer.queue.staged) == 0 || peer.device.packetBudget != nil) && peer.isRunning.Load() {
+		elem := peer.device.newKeepaliveElement()
+		if elem == nil {
+			return
+		}
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
-		select {
-		case peer.queue.staged <- elemsContainer:
-			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
-		default:
-			peer.device.PutMessageBuffer(elem.buffer)
-			peer.device.PutOutboundElement(elem)
-			peer.device.PutOutboundElementsContainer(elemsContainer)
+		if peer.device.packetBudget != nil {
+			peer.StagePackets(elemsContainer)
+		} else {
+			select {
+			case peer.queue.staged <- elemsContainer:
+				peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
+			default:
+				peer.device.dropOutbound(elemsContainer)
+			}
 		}
 	}
 	peer.SendStagedPackets()
+}
+
+// hasSendableKeypair reports whether staged packets can be encrypted now,
+// using the same conditions as SendStagedPackets.
+func (peer *Peer) hasSendableKeypair() bool {
+	keypair := peer.keypairs.Current()
+	return keypair != nil && keypair.sendNonce.Load() < RejectAfterMessages && time.Since(keypair.created) < RejectAfterTime
 }
 
 func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error) {
@@ -115,7 +143,11 @@ func (peer *Peer) sendControlPacket(msgType uint32, payload []byte) (bool, error
 		return false, nil
 	}
 
-	packet := make([]byte, MessageTransportHeaderSize+len(payload)+poly1305.TagSize)
+	packet := peer.device.controlBuffer(MessageTransportHeaderSize + len(payload) + poly1305.TagSize)
+	if packet == nil {
+		return false, errPacketBudget
+	}
+	defer peer.device.releaseControlBuffer(packet)
 	header := packet[:MessageTransportHeaderSize]
 	binary.LittleEndian.PutUint32(header[0:4], msgType)
 	binary.LittleEndian.PutUint32(header[4:8], keypair.remoteIndex)
@@ -169,7 +201,11 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		return err
 	}
 
-	packet := make([]byte, MessageInitiationSize)
+	packet := peer.device.controlBuffer(MessageInitiationSize)
+	if packet == nil {
+		return errPacketBudget
+	}
+	defer peer.device.releaseControlBuffer(packet)
 	_ = msg.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
 
@@ -198,7 +234,11 @@ func (peer *Peer) SendHandshakeResponse() error {
 		return err
 	}
 
-	packet := make([]byte, MessageResponseSize)
+	packet := peer.device.controlBuffer(MessageResponseSize)
+	if packet == nil {
+		return errPacketBudget
+	}
+	defer peer.device.releaseControlBuffer(packet)
 	_ = response.marshal(packet)
 	peer.cookieGenerator.AddMacs(packet)
 
@@ -230,7 +270,11 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 		return err
 	}
 
-	packet := make([]byte, MessageCookieReplySize)
+	packet := device.controlBuffer(MessageCookieReplySize)
+	if packet == nil {
+		return errPacketBudget
+	}
+	defer device.releaseControlBuffer(packet)
 	_ = reply.marshal(packet)
 	// TODO: allocation could be avoided
 	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
@@ -270,10 +314,16 @@ func (device *Device) RoutineReadFromTUN() {
 	)
 
 	for i := range elems {
-		elems[i] = device.NewOutboundElement()
-		bufs[i] = elems[i].buffer[:]
+		if device.packetBudget != nil {
+			elems[i] = device.GetOutboundElement()
+			elems[i].buffer = device.readBuffers[i]
+		} else {
+			elems[i] = device.NewOutboundElement()
+		}
+		bufs[i] = device.tunReadBuffer(elems[i].buffer)
 	}
 
+	device.readBuffers = nil
 	defer func() {
 		for _, elem := range elems {
 			if elem != nil {
@@ -288,6 +338,10 @@ func (device *Device) RoutineReadFromTUN() {
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
+				continue
+			}
+			if device.packetBufferSize() < MaxMessageSize &&
+				(sizes[i] > len(bufs[i])-offset || sizes[i] > int(device.tun.mtu.Load())) {
 				continue
 			}
 
@@ -318,14 +372,18 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
+			replacement := device.NewOutboundElement()
+			if replacement == nil {
+				continue
+			} // Reuse workspace and discard data.
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
 				elemsByPeer[peer] = elemsForPeer
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
-			bufs[i] = elems[i].buffer[:]
+			elems[i] = replacement
+			bufs[i] = device.tunReadBuffer(elems[i].buffer)
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
@@ -343,6 +401,11 @@ func (device *Device) RoutineReadFromTUN() {
 		}
 
 		if readErr != nil {
+			if device.packetBufferSize() < MaxMessageSize && errors.Is(readErr, io.ErrShortBuffer) {
+				// This capability guarantees the oversized packet was consumed;
+				// keep the tunnel alive for subsequent valid packets.
+				continue
+			}
 			if errors.Is(readErr, tun.ErrTooManySegments) {
 				// TODO: record stat for this
 				// This will happen if MSS is surprisingly small (< 576)
@@ -362,6 +425,21 @@ func (device *Device) RoutineReadFromTUN() {
 }
 
 func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
+	if peer.device.packetBudget != nil {
+		peer.device.admissionMu.Lock()
+		admitted := peer.device.packetBudget.Admit(func() bool {
+			if peer.device.isClosed() || !peer.isRunning.Load() || !queueRoom(peer.queue.staged, outboundControl(elems)) {
+				return false
+			}
+			peer.queue.staged <- elems
+			return true
+		})
+		peer.device.admissionMu.Unlock()
+		if !admitted {
+			peer.device.dropOutbound(elems)
+		}
+		return
+	}
 	for {
 		select {
 		case peer.queue.staged <- elems:
@@ -427,10 +505,7 @@ top:
 			}
 
 			// add to parallel and sequential queue
-			if peer.isRunning.Load() {
-				peer.queue.outbound.c <- elemsContainer
-				peer.device.queue.encryption.c <- elemsContainer
-			} else {
+			if !peer.device.admitOutbound(peer, elemsContainer) {
 				for _, elem := range elemsContainer.elems {
 					peer.device.PutMessageBuffer(elem.buffer)
 					peer.device.PutOutboundElement(elem)
@@ -504,6 +579,12 @@ func (device *Device) RoutineEncryption(id int) {
 
 			// pad content to multiple of 16
 			paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
+			if device.packetBufferSize() < MaxMessageSize && len(elem.packet)+paddingSize+MessageTransportSize > len(elem.buffer) {
+				// An MTU change may race a queued packet. Never let append or Seal
+				// silently escape the configured storage budget.
+				elem.packet = nil
+				continue
+			}
 			elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
 
 			// encrypt content and release to consumer
@@ -553,6 +634,9 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 		dataSent := false
 		elemsContainer.Lock()
 		for _, elem := range elemsContainer.elems {
+			if elem.packet == nil {
+				continue
+			}
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
 			}

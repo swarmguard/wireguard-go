@@ -28,9 +28,13 @@ func (device *Device) RoutineTUNEventReader() {
 				continue
 			}
 			var tooLarge string
-			if mtu > MaxContentSize {
-				tooLarge = fmt.Sprintf(" (too large, capped at %v)", MaxContentSize)
-				mtu = MaxContentSize
+			maxContentSize := device.packetBufferSize() - MessageTransportSize
+			if mtu > maxContentSize {
+				if device.packetBufferSize() < MaxMessageSize {
+					device.log.Errorf("TUN MTU %d exceeds fixed WireGuard buffer payload capacity %d; effective MTU capped, oversized packets will be dropped", mtu, maxContentSize)
+				}
+				tooLarge = fmt.Sprintf(" (too large, capped at %v)", maxContentSize)
+				mtu = maxContentSize
 			}
 			old := device.tun.mtu.Swap(int32(mtu))
 			if int(old) != mtu {

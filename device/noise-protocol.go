@@ -661,8 +661,8 @@ func (peer *Peer) BeginSymmetricSession() error {
 	// create AEAD instances
 
 	keypair := new(Keypair)
-	keypair.send, _ = chacha20poly1305.New(sendKey[:])
-	keypair.receive, _ = chacha20poly1305.New(recvKey[:])
+	keypair.send, _ = newDataAEAD(sendKey[:])
+	keypair.receive, _ = newDataAEAD(recvKey[:])
 
 	setZero(sendKey[:])
 	setZero(recvKey[:])
