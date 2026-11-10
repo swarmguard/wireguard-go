@@ -626,6 +626,10 @@ func tcpGRO(bufs [][]byte, offset int, pktI int, table *tcpGROTable, isV6 bool) 
 			case coalesceItemInvalidCSum:
 				// delete the item with an invalid csum
 				table.deleteAt(item.key, i)
+				// The deleted item will not be re-visited in applyTCPCoalesceAccounting,
+				// so we must zero the virtioNetHdr. clear() is the equivalent of
+				// encoding a zero value virtioNetHdr.
+				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			case coalescePktInvalidCSum:
 				// no point in inserting an item that we can't coalesce
 				return groResultNoop
@@ -685,11 +689,7 @@ func applyTCPCoalesceAccounting(bufs [][]byte, offset int, table *tcpGROTable) e
 				psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_TCP, srcAddr, dstAddr, uint16(len(pkt)-int(item.iphLen)))
 				binary.BigEndian.PutUint16(pkt[hdr.csumStart+hdr.csumOffset:], checksum([]byte{}, psum))
 			} else {
-				hdr := virtioNetHdr{}
-				err := hdr.encode(bufs[item.bufsIndex][offset-virtioNetHdrLen:])
-				if err != nil {
-					return err
-				}
+				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			}
 		}
 	}
@@ -745,11 +745,7 @@ func applyUDPCoalesceAccounting(bufs [][]byte, offset int, table *udpGROTable) e
 				psum := pseudoHeaderChecksumNoFold(unix.IPPROTO_UDP, srcAddr, dstAddr, uint16(len(pkt)-int(item.iphLen)))
 				binary.BigEndian.PutUint16(pkt[hdr.csumStart+hdr.csumOffset:], checksum([]byte{}, psum))
 			} else {
-				hdr := virtioNetHdr{}
-				err := hdr.encode(bufs[item.bufsIndex][offset-virtioNetHdrLen:])
-				if err != nil {
-					return err
-				}
+				clear(bufs[item.bufsIndex][offset-virtioNetHdrLen : offset])
 			}
 		}
 	}
@@ -898,11 +894,7 @@ func handleGRO(bufs [][]byte, offset int, tcpTable *tcpGROTable, udpTable *udpGR
 		}
 		switch result {
 		case groResultNoop:
-			hdr := virtioNetHdr{}
-			err := hdr.encode(bufs[i][offset-virtioNetHdrLen:])
-			if err != nil {
-				return err
-			}
+			clear(bufs[i][offset-virtioNetHdrLen : offset])
 			fallthrough
 		case groResultTableInsert:
 			*toWrite = append(*toWrite, i)
