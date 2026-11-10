@@ -1,1 +1,4 @@
 wireguard-go
+
+# Temporary ARM assembly regeneration files.
+/tsasm/arm/regen/.cache/
