@@ -351,6 +351,12 @@ func tcpPacketsCanCoalesce(pkt []byte, iphLen, tcphLen uint8, seq uint32, pshSet
 		// cannot coalesce with unequal tcp options len
 		return coalesceUnavailable
 	}
+	// A merged packet keeps one TCP header for every segment. Do not lose
+	// advertised-window updates or differing reserved/NS flags.
+	if pkt[iphLen+12]&0x0f != pktTarget[item.iphLen+12]&0x0f ||
+		binary.BigEndian.Uint16(pkt[iphLen+14:]) != binary.BigEndian.Uint16(pktTarget[item.iphLen+14:]) {
+		return coalesceUnavailable
+	}
 	if tcphLen > 20 {
 		if !bytes.Equal(pkt[iphLen+20:iphLen+tcphLen], pktTarget[item.iphLen+20:iphLen+tcphLen]) {
 			// cannot coalesce with unequal tcp options
