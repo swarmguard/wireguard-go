@@ -155,3 +155,41 @@ func TestAdmissionClosure(t *testing.T) {
 		t.Fatal("admitted after closure")
 	}
 }
+
+// TestMixedCachedOwnership keeps differently sized data and control buffers
+// distinct through repeated reuse and closure.
+func TestMixedCachedOwnership(t *testing.T) {
+	budget, err := New(Config{MaxBytes: 4096, ControlReserveBytes: 1024, MaxCachedBytes: 4096, QueueEntries: 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	type request struct {
+		size    int
+		control bool
+	}
+	requests := []request{{128, false}, {256, false}, {128, true}, {512, false}, {256, true}}
+	for range 20 {
+		active := make(map[*byte]bool)
+		buffers := make([][]byte, 0, len(requests))
+		for _, request := range requests {
+			buffer := budget.Get(request.size, request.control)
+			if buffer == nil || cap(buffer) != request.size || active[&buffer[0]] {
+				t.Fatal("invalid or aliased storage")
+			}
+			active[&buffer[0]] = true
+			buffers = append(buffers, buffer)
+		}
+		if stats := budget.Snapshot(); stats.Outstanding != len(requests) || stats.ManagedBytes > 4096 {
+			t.Fatal(stats)
+		}
+		for _, buffer := range buffers {
+			if !budget.Put(buffer) || budget.Put(buffer) {
+				t.Fatal("invalid return accounting")
+			}
+		}
+	}
+	budget.Close()
+	if stats := budget.Snapshot(); stats.ManagedBytes != 0 || stats.Outstanding != 0 || stats.CachedBytes != 0 {
+		t.Fatal(stats)
+	}
+}

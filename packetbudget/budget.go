@@ -92,9 +92,12 @@ func (b *Budget) Get(size int, control bool) []byte {
 		b.stats.AllocationRejections++
 		return nil
 	}
-	for i, a := range b.free {
+	// Recent returns usually have the next packet's size. Reuse from the end
+	// without shifting the entire cache while holding the accounting lock.
+	for i := len(b.free) - 1; i >= 0; i-- {
+		a := b.free[i]
 		if cap(a.bytes) == size && a.control == control {
-			copy(b.free[i:], b.free[i+1:])
+			b.free[i] = b.free[len(b.free)-1]
 			b.free[len(b.free)-1] = nil
 			b.free = b.free[:len(b.free)-1]
 			a.cached = false
